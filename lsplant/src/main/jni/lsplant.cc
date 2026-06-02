@@ -119,6 +119,11 @@ std::string generated_source_name;
 std::string generated_field_name;
 std::string generated_method_name;
 
+// shadowhook：保存 InitInfo 的 mem_map/mem_unmap（InitConfig 时复制）。
+// GenerateTrampolineFor 不接收 InitInfo，故用文件级 static 中转。
+static InitInfo::MemMapFunType   g_mem_map   = nullptr;
+static InitInfo::MemUnmapFunType g_mem_unmap = nullptr;
+
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
         LOGE("generated class name cannot be empty");
@@ -136,6 +141,8 @@ bool InitConfig(const InitInfo &info) {
     }
     generated_method_name = info.generated_method_name;
     generated_source_name = info.generated_source_name;
+    g_mem_map   = info.mem_map;
+    g_mem_unmap = info.mem_unmap;
     return true;
 }
 
@@ -495,9 +502,12 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
                 trampoline_lock.wait(true, std::memory_order_acquire);
                 continue;
             }
-            address = reinterpret_cast<uintptr_t>(mmap(nullptr, kPageSize,
-                                                       PROT_READ | PROT_WRITE | PROT_EXEC,
-                                                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
+            void *tramp_page = g_mem_map
+                ? g_mem_map(nullptr, kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)
+                : mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+            address = reinterpret_cast<uintptr_t>(tramp_page);
             if (address == reinterpret_cast<uintptr_t>(MAP_FAILED)) {
                 PLOGE("mmap trampoline");
                 trampoline_lock.clear(std::memory_order_release);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <jni.h>
+#include <sys/types.h>
 
 #include <functional>
 #include <string_view>
@@ -60,6 +61,17 @@ struct InitInfo {
     /// \brief The generated class name. Must not be empty. If {target} is set,
     /// it will follows the name of the target.
     std::string_view generated_method_name = "{target}";
+
+    // 非 stock 扩展（shadowhook）：把 Java 方法 trampoline 页的分配/释放路由到
+    // 自定义实现，用于让跳板页从 /proc/maps 隐身（接内核 Ghost Memory）。
+    // 契约：mem_map 返回的内存在写入期必须可写、执行期必须可执行（RWX），
+    //       因 GenerateTrampolineFor 会对返回地址 memcpy + 写 ArtMethod* +
+    //       __builtin___clear_cache。null 时用默认 mmap/munmap（向后兼容）。
+    using MemMapFunType   = std::function<void *(void *addr, size_t length, int prot,
+                                                 int flags, int fd, off_t offset)>;
+    using MemUnmapFunType = std::function<int(void *addr, size_t length)>;
+    MemMapFunType   mem_map   = nullptr;
+    MemUnmapFunType mem_unmap = nullptr;
 };
 
 /// \brief Initialize LSPlant for the proceeding hook.
