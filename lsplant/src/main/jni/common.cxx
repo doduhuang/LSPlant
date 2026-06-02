@@ -90,7 +90,14 @@ inline auto IsJavaDebuggable(JNIEnv * env) {
 
 constexpr auto kPointerSize = sizeof(void *);
 
-SharedHashMap<art::ArtMethod *, std::pair<jobject, art::ArtMethod *>> hooked_methods_;
+// shadowhook: 值从 pair<jobject, ArtMethod*> 扩展为 tuple<jobject, ArtMethod*, jmethodID>，
+// 其中第三个元素是在 Hook 时（DoHook 之前，backup 未被 BackupTo 污染时）取到的 backup
+// 的 jmethodID（opaque 模式下是 opaque index，pointer 模式下是 ArtMethod* 强转）。
+// 存入这个值是为了让 UnHook 时的 kInternalMethods 传播在 opaque jni ids 模式下也能正确
+// 比较，而不必在 UnHook 时重新调用 env->FromReflectedMethod（那时 backup 已被 BackupTo
+// 覆写，DexMethodIndex 变成 target 的，ART EncodeGenericId 会越界崩溃）。
+// 对 backup 的辅助条目（nullptr, target, 0）第三字段不使用，置 0。
+SharedHashMap<art::ArtMethod *, std::tuple<jobject, art::ArtMethod *, jmethodID>> hooked_methods_;
 
 SharedHashMap<const art::dex::ClassDef *, phmap::flat_hash_set<art::ArtMethod *>>
     hooked_classes_;
@@ -108,7 +115,9 @@ std::shared_mutex jit_movements_lock_;
 inline art::ArtMethod *IsHooked(art::ArtMethod * art_method, bool including_backup = false) {
     art::ArtMethod *backup = nullptr;
     hooked_methods_.if_contains(art_method, [&backup, &including_backup](const auto &it) {
-        if (including_backup || it.second.first) backup = it.second.second;
+        // tuple: (reflected_backup jobject, backup ArtMethod*, backup jmethodID)
+        // target 条目：reflected_backup 非 null；backup 条目：reflected_backup = null
+        if (including_backup || std::get<0>(it.second)) backup = std::get<1>(it.second);
     });
     return backup;
 }
@@ -116,7 +125,7 @@ inline art::ArtMethod *IsHooked(art::ArtMethod * art_method, bool including_back
 inline art::ArtMethod *IsBackup(art::ArtMethod * art_method) {
     art::ArtMethod *backup = nullptr;
     hooked_methods_.if_contains(art_method, [&backup](const auto &it) {
-        if (!it.second.first) backup = it.second.second;
+        if (!std::get<0>(it.second)) backup = std::get<1>(it.second);
     });
     return backup;
 }
@@ -130,15 +139,21 @@ inline std::list<std::pair<art::ArtMethod *, art::ArtMethod *>> GetJitMovements(
     return std::move(jit_movements_);
 }
 
+// shadowhook: 增加 backup_jmethodid 参数——Hook 时在 DoHook 之前（backup 未被 BackupTo
+// 污染时）取到的 opaque jmethodID，存入 tuple 第三字段，供 UnHook kInternalMethods 传播用。
 inline void RecordHooked(art::ArtMethod * target, const art::dex::ClassDef *class_def,
-                         jobject reflected_backup, art::ArtMethod *backup) {
+                         jobject reflected_backup, art::ArtMethod *backup,
+                         jmethodID backup_jmethodid) {
     hooked_classes_.lazy_emplace_l(
         class_def, [&target](auto &it) { it.second.emplace(target); },
         [&class_def, &target](const auto &ctor) {
             ctor(class_def, phmap::flat_hash_set<art::ArtMethod *>{target});
         });
-    hooked_methods_.insert({std::make_pair(target, std::make_pair(reflected_backup, backup)),
-                            std::make_pair(backup, std::make_pair(nullptr, target))});
+    hooked_methods_.insert(
+        {std::make_pair(target,
+                        std::make_tuple(reflected_backup, backup, backup_jmethodid)),
+         // backup 的辅助条目：reflected_backup=null 区分身份，jmethodid 置 nullptr（不使用）
+         std::make_pair(backup, std::make_tuple(nullptr, target, static_cast<jmethodID>(nullptr)))});
 }
 
 inline void RecordDeoptimized(const art::dex::ClassDef *class_def, art::ArtMethod *art_method) {

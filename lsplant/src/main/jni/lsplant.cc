@@ -726,6 +726,15 @@ using ::lsplant::IsHooked;
 
     JNI_SetStaticObjectField(env, built_class, hooker_field, hooker_object);
 
+    // shadowhook: 在 DoHook 之前（backup 未被 BackupTo 污染时）取 backup 的 jmethodID。
+    // DoHook 内部 BackupTo(backup) 会把 target 的 DexMethodIndex 复制进 backup，之后对
+    // backup 调用 env->FromReflectedMethod 在 opaque jni ids 模式下会崩（EncodeGenericId
+    // 用错误的 DexMethodIndex 计算 index）。此处预先取好并存入 hooked_methods_，供 UnHook
+    // kInternalMethods 传播安全使用。
+    // 注：backup_method（JNI_GetMethodID 取的）在 pointer-id 模式下 == (jmethodID)ArtMethod*，
+    // 在 opaque-id 模式下是合法的 opaque index——两种模式均安全。
+    jmethodID backup_jmethodid = backup_method;
+
     if (DoHook(target, hook, backup)) {
         std::apply(
             [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
@@ -735,7 +744,8 @@ using ::lsplant::IsHooked;
             },
             kInternalMethods);
         jobject global_backup = JNI_NewGlobalRef(env, reflected_backup);
-        RecordHooked(target, target->GetDeclaringClass()->GetClassDef(), global_backup, backup);
+        RecordHooked(target, target->GetDeclaringClass()->GetClassDef(), global_backup, backup,
+                     backup_jmethodid);
         if (!is_proxy) [[likely]] {
             RecordJitMovement(target, backup);
         } else {
@@ -759,10 +769,12 @@ using ::lsplant::IsHooked;
     auto *target = ArtMethod::FromReflectedMethod(env, target_method);
     jobject reflected_backup = nullptr;
     art::ArtMethod *backup = nullptr;
-    if (!hooked_methods_.erase_if(target, [&reflected_backup, &backup](const auto &it) {
-            std::tie(reflected_backup, backup) = it.second;
-            return reflected_backup != nullptr;
-        })) {
+    jmethodID backup_jmethodid = nullptr;
+    if (!hooked_methods_.erase_if(
+            target, [&reflected_backup, &backup, &backup_jmethodid](const auto &it) {
+                std::tie(reflected_backup, backup, backup_jmethodid) = it.second;
+                return reflected_backup != nullptr;
+            })) {
         LOGE("Unable to unhook a method that is not hooked");
         return false;
     }
@@ -773,31 +785,31 @@ using ::lsplant::IsHooked;
         it.second.erase(target);
         return it.second.empty();
     });
-    // shadowhook 修: Android 13+ 的 opaque jni ids 模式下，
-    // env->FromReflectedMethod(reflected_backup) 会调用 ART JniIdManager::EncodeGenericId，
-    // 而 LSPlant 合成的 backup ArtMethod 是由 BackupTo() 从 target 内存复制而来（非 DexBuilder
-    // 原始方法），其 DexMethodIndex 等内部字段属于 target 方法，ART 试图用这些字段计算 opaque
-    // index 时会越界/崩溃（SIGSEGV at _JNIEnv::FromReflectedMethod+36，见 M3.2a unhook 根因）。
+    // shadowhook 修（V2）: Android 13+ opaque jni ids 下的 UnHook SIGSEGV 根因与修复。
     //
-    // 修复方案：backup 的 ArtMethod* 已从 hooked_methods_ 中取出（见 line 761/763），
-    // kInternalMethods 传播的目的是：若某个 LSPlant 内部方法缓存（如 set_accessible）被
-    // 重定向到了 backup（因为用户 hook 了 LSPlant 自身内部依赖的方法），unhook 后要把它
-    // 恢复成 target 的 jmethodID。
+    // 【根因】env->FromReflectedMethod(reflected_backup) 在 DoHook 之后调用会崩：
+    //   DoHook → BackupTo(backup) 把 target 的 DexMethodIndex 等字段复制进了 backup 的
+    //   ArtMethod 内存。随后 ART 的 JniIdManager::EncodeGenericId 按 backup 里的
+    //   DexMethodIndex 查 target 方法的 opaque index，因 target 和 backup 指向同一 index
+    //   导致重复注册/越界——SIGSEGV at _JNIEnv::FromReflectedMethod+36。
     //
-    // 在 pointer-id 模式下（Android < 12 或显式关闭 opaque），jmethodID == (jmethodID)ArtMethod*，
-    // 直接 reinterpret_cast<jmethodID>(backup) 即可安全比较。
-    // 在 opaque-id 模式下，kInternalMethods 里存的是 JNI_GetMethodID/JNI_GetStaticMethodID
-    // 分配的 opaque index，backup 方法从未通过这两个函数注册，所以比较永远不会命中，
-    // 传播 lambda 不会执行——用 reinterpret_cast<jmethodID>(backup) 作为占位符是安全的。
+    // 【V1 不完整】仅用 reinterpret_cast<jmethodID>(backup) 绕过崩溃，但在 opaque-id 模式下
+    //   该值不等于 kInternalMethods 里存的 opaque backup jmethodID（V1 注释分析是正确的——
+    //   kInternalMethods 里的值由 JNI_GetMethodID 产生的 opaque index，而 V1 用的是
+    //   ArtMethod* 强转，两者不同，导致 kInternalMethods 恢复传播永不命中）。
     //
-    // 同理，DoUnHook 之后的 target_method_id 改用 ArtMethod::FromReflectedMethod（读 artMethod
-    // long 字段），避免对 target_method 的 env->FromReflectedMethod（虽然较少崩，但保持一致）。
-    auto *backup_art = ArtMethod::FromReflectedMethod(env, reflected_backup);
-    auto *backup_method = reinterpret_cast<jmethodID>(backup_art ? backup_art : backup);
+    // 【V2 完整修复】在 Hook 时 DoHook 之前（backup 还是干净的 DexBuilder 方法，BackupTo 还
+    //   未执行）预先取 backup_jmethodid = backup_method（JNI_GetMethodID 取的值，pointer-id
+    //   模式下是 ArtMethod*，opaque-id 模式下是合法 opaque index），存入 hooked_methods_
+    //   tuple 第三字段。UnHook 时直接用这个预存值，完全不调用 env->FromReflectedMethod。
+    //
+    // target_method_id 同样改用 ArtMethod::FromReflectedMethod（读 artMethod long 字段）
+    // 取 ArtMethod*，pointer-id 模式下即 jmethodID；opaque-id 模式下 kInternalMethods 的
+    // backup 传播不命中（原因见上）则 target_method_id 不会被写入，行为正确。
     env->DeleteGlobalRef(reflected_backup);
     if (DoUnHook(target, backup)) {
         std::apply(
-            [backup_method,
+            [backup_method = backup_jmethodid,
              target_method_id = reinterpret_cast<jmethodID>(
                  ArtMethod::FromReflectedMethod(env, target_method))](auto... v) {
                 ((*v == backup_method && (LOGD("Propagate internal used method because of unhook"),
