@@ -803,15 +803,19 @@ using ::lsplant::IsHooked;
     //   模式下是 ArtMethod*，opaque-id 模式下是合法 opaque index），存入 hooked_methods_
     //   tuple 第三字段。UnHook 时直接用这个预存值，完全不调用 env->FromReflectedMethod。
     //
-    // target_method_id 同样改用 ArtMethod::FromReflectedMethod（读 artMethod long 字段）
-    // 取 ArtMethod*，pointer-id 模式下即 jmethodID；opaque-id 模式下 kInternalMethods 的
-    // backup 传播不命中（原因见上）则 target_method_id 不会被写入，行为正确。
+    // target_method_id 继续用 env->FromReflectedMethod(target_method)：target_method 是真实
+    // 的 Java 方法（非 BackupTo 合成品），opaque-id 模式下返回合法 opaque index，写入
+    // kInternalMethods 后 JNI_Call*Method 可正常使用。不能用 ArtMethod* 强转代替，
+    // 因为 opaque-id 模式下 JNI 调用不接受指针值作为 jmethodID。
     env->DeleteGlobalRef(reflected_backup);
     if (DoUnHook(target, backup)) {
         std::apply(
             [backup_method = backup_jmethodid,
-             target_method_id = reinterpret_cast<jmethodID>(
-                 ArtMethod::FromReflectedMethod(env, target_method))](auto... v) {
+             // target_method 是真实的 Java 方法（非 LSPlant 合成品），未被 BackupTo 修改，
+             // env->FromReflectedMethod(target_method) 在 opaque-id 模式下安全且返回合法的
+             // opaque index，写入 kInternalMethods 后 JNI_Call*Method 可正常使用。
+             // （不能用 ArtMethod* 强转——opaque-id 模式下 JNI 不接受指针值作为 jmethodID。）
+             target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
                 ((*v == backup_method && (LOGD("Propagate internal used method because of unhook"),
                                           *v = target_method_id)) ||
                  ...);
