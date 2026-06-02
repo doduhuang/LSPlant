@@ -773,11 +773,33 @@ using ::lsplant::IsHooked;
         it.second.erase(target);
         return it.second.empty();
     });
-    auto *backup_method = env->FromReflectedMethod(reflected_backup);
+    // shadowhook 修: Android 13+ 的 opaque jni ids 模式下，
+    // env->FromReflectedMethod(reflected_backup) 会调用 ART JniIdManager::EncodeGenericId，
+    // 而 LSPlant 合成的 backup ArtMethod 是由 BackupTo() 从 target 内存复制而来（非 DexBuilder
+    // 原始方法），其 DexMethodIndex 等内部字段属于 target 方法，ART 试图用这些字段计算 opaque
+    // index 时会越界/崩溃（SIGSEGV at _JNIEnv::FromReflectedMethod+36，见 M3.2a unhook 根因）。
+    //
+    // 修复方案：backup 的 ArtMethod* 已从 hooked_methods_ 中取出（见 line 761/763），
+    // kInternalMethods 传播的目的是：若某个 LSPlant 内部方法缓存（如 set_accessible）被
+    // 重定向到了 backup（因为用户 hook 了 LSPlant 自身内部依赖的方法），unhook 后要把它
+    // 恢复成 target 的 jmethodID。
+    //
+    // 在 pointer-id 模式下（Android < 12 或显式关闭 opaque），jmethodID == (jmethodID)ArtMethod*，
+    // 直接 reinterpret_cast<jmethodID>(backup) 即可安全比较。
+    // 在 opaque-id 模式下，kInternalMethods 里存的是 JNI_GetMethodID/JNI_GetStaticMethodID
+    // 分配的 opaque index，backup 方法从未通过这两个函数注册，所以比较永远不会命中，
+    // 传播 lambda 不会执行——用 reinterpret_cast<jmethodID>(backup) 作为占位符是安全的。
+    //
+    // 同理，DoUnHook 之后的 target_method_id 改用 ArtMethod::FromReflectedMethod（读 artMethod
+    // long 字段），避免对 target_method 的 env->FromReflectedMethod（虽然较少崩，但保持一致）。
+    auto *backup_art = ArtMethod::FromReflectedMethod(env, reflected_backup);
+    auto *backup_method = reinterpret_cast<jmethodID>(backup_art ? backup_art : backup);
     env->DeleteGlobalRef(reflected_backup);
     if (DoUnHook(target, backup)) {
         std::apply(
-            [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
+            [backup_method,
+             target_method_id = reinterpret_cast<jmethodID>(
+                 ArtMethod::FromReflectedMethod(env, target_method))](auto... v) {
                 ((*v == backup_method && (LOGD("Propagate internal used method because of unhook"),
                                           *v = target_method_id)) ||
                  ...);
