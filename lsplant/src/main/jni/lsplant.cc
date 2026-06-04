@@ -51,6 +51,10 @@ extern "C" void *shadowhook_pte_install_for_lsplant_ex(void *target, void *hooke
                                                        int *out_slot_idx);
 extern "C" long shadowhook_pte_uninstall_for_lsplant(int slot_idx, void *target_va_for_dobby);
 
+/* M4b-Polish I3 (P1-F structural limit fix): DoUnHook 失败时标记 KPM slot 为 stuck
+ * (PTE 仍 UXN-armed + do_mem_abort handler 仍服务防 SIGSEGV). 仅 telemetry. */
+extern "C" void shadowhook_pte_force_recycle_slot_for_lsplant(int slot_idx);
+
 module lsplant;
 
 import dex_builder;
@@ -676,26 +680,34 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
                       slot_for_target,
                       reinterpret_cast<void *>(original_oat_va));
         if (rc != 0) {
-            /* [R3+R4 P1-F+codex 反复 trade-off]:
-             * uninstall 失败的现实困境：
-             *   选项A "DoUnHook 返 false 让上层 hooked_methods_ 保留"——不行：lsplant 上游
-             *      `UnHook` (line ~890-906) 在 DoUnHook 之前已 `erase_if(hooked_methods_)` +
-             *      `erase(backup)` + `erase(hooked_classes_)`+ `DeleteGlobalRef(reflected_backup)`，
-             *      到达 DoUnHook 时上层追踪已全清，返 false 也救不回 LSPlant 视角；
-             *      只是让 DoUnHook 自己的 pte_hook_slots_ 表保留——单点保留意义有限.
-             *   选项B 继续往下 erase + restore entry_point——风险：target 页仍 UXN-armed
-             *      但 do_mem_abort handler 仍调原 ghost trampoline；trampoline 仍在原位
-             *      （uninstall 失败 → ghost 未 free → trampoline 还能跑）→ hook 仍生效；
-             *      但 LSPlant 视角已"unhooked"——掉子状态不一致.
+            /* [M4b-Polish I3 fix, codex round 4+5 P2]: uninstall 失败现实困境的两层处理：
              *
-             * 当前选 B（continue + 大声 log + erase）：至少 user 视角内 lsplant_hook_slots_
-             * 不留悬空记录；且因 ghost 仍在（uninstall 失败常意味着 KPM 端没释放 → ghost
-             * 仍 valid），target 上 Java 方法仍被 hook 但不崩；至少**安全失败**。
+             *   ① PTE 主路径 (slot_for_target >= 0)：调 force_recycle 标记 KPM slot 为 stuck
+             *      (PTE 仍 UXN-armed + do_mem_abort handler 仍服务 → target App 不会 SIGSEGV).
+             *      LSPlant 视角已"unhooked"但 KPM hook 仍生效；可通过 SH_CMD_PTE_HOOK_STUCK_COUNT
+             *      0x7006 查询 stuck 总数, controller 决定是否 kill app + reload KPM.
              *
-             * 真正的根治需要把 UnHook 上层的 erase 移到 DoUnHook 之后（M4b.4+ 上游拍板）. */
-            LOGE("M4b uninstall failed rc=%ld slot=%d target=%p — PERMANENT LEAK; "
-                 "hook may remain active even after UnHook returns true",
-                 rc, slot_for_target, target);
+             *   ② Dobby fallback (slot_for_target == -2)：rc 来自 DobbyDestroy. 与 PTE telemetry
+             *      无关，不走 force_recycle. Dobby far trampoline 可能 leak.
+             *
+             * 真正的根治需要把 UnHook 上层的 erase 移到 DoUnHook 之后 (lsplant 上游 PR). */
+            if (slot_for_target >= 0) {
+                /* 真 PTE slot path: mark stuck for telemetry (codex round 2 P1 fix: 不能清 used)
+                 * codex round 7 P3 fix: rc 是 long, 用 %ld. */
+                LOGE("M4b-PTE shadowhook_pte_uninstall_for_lsplant(slot=%d, .oat=%p) failed rc=%ld; "
+                     "marking slot as stuck (telemetry-only: PTE 仍 UXN-armed, do_mem_abort handler 仍服务; "
+                     "ghost+slot leak ~16KB+1 entry, query SH_CMD_PTE_HOOK_STUCK_COUNT 决定 reload).",
+                     slot_for_target, (void *)original_oat_va, rc);
+                /* M4b-Polish I3 (telemetry-only after codex P1): 仅打 stuck 标记, 不释放 slot.
+                 * 真正根治 = 移 erase 到 DoUnHook 之后 (上游 PR), 留 follow-up. */
+                shadowhook_pte_force_recycle_slot_for_lsplant(slot_for_target);
+            } else {
+                /* Dobby fallback path: rc 来自 DobbyDestroy. 与 PTE telemetry 无关.
+                 * codex round 7 P3 fix: rc 是 long, 用 %ld. */
+                LOGE("M4b-Dobby-fallback DobbyDestroy(.oat=%p) failed rc=%ld (slot_for_target=%d sentinel); "
+                     "Dobby far trampoline 可能 leak, 但不计入 PTE stuck_count.",
+                     (void *)original_oat_va, rc, slot_for_target);
+            }
             /* fallthrough: erase 跟踪 + restore entry_point. */
         }
         /* [R2 P1-C 修] 还原 backup.entry_point → original_oat_va：
