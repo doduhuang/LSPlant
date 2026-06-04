@@ -31,7 +31,7 @@ private:
         BackupMethods out;
         if (!class_def) return;
         {
-            hooked_classes_.if_contains(class_def, [&out](const auto &it) {
+            hooked_classes_().if_contains(class_def, [&out](const auto &it) {
                 for (auto method : it.second) {
                     if (method->IsStatic()) {
                         LOGV("Backup hooked method %p because of initialization", method);
@@ -41,7 +41,7 @@ private:
             });
         }
         {
-            deoptimized_classes_.if_contains(class_def, [&out](const auto &it) {
+            deoptimized_classes_().if_contains(class_def, [&out](const auto &it) {
                 for (auto method : it.second) {
                     if (method->IsStatic()) {
                         LOGV("Backup deoptimized method %p because of initialization", method);

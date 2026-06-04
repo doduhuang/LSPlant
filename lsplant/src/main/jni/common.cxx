@@ -97,24 +97,56 @@ constexpr auto kPointerSize = sizeof(void *);
 // 比较，而不必在 UnHook 时重新调用 env->FromReflectedMethod（那时 backup 已被 BackupTo
 // 覆写，DexMethodIndex 变成 target 的，ART EncodeGenericId 会越界崩溃）。
 // 对 backup 的辅助条目（nullptr, target, 0）第三字段不使用，置 0。
-SharedHashMap<art::ArtMethod *, std::tuple<jobject, art::ArtMethod *, jmethodID>> hooked_methods_;
+//
+// shadowhook M5.2g.3.1 root cause fix: 这些全局 SharedHashMap/Set/list 默认构造的
+// init_array 顺序与 jni_bridge.cpp 的 __attribute__((constructor)) 顺序不可控.
+// 当 dlopen-loaded ctor 比 lsplant.cc 的静态全局更早 init 时, lsplant::Init 在 ctor 里被调用
+// → InitNative 安装 Class::SetStatus hook → 任何 class init (verifyClass) 调 SetStatus
+// → hook callback 调 BackupClassMethods → hooked_classes_().if_contains() → phmap ctrl_=0
+// (bss zero-init, 未构造) → SIGSEGV at 0x0 inside VerifyClass+216.
+// 修复: 用 Meyer's singleton (函数内 static, 首次访问惰性构造, thread-safe) 绕开 init_array 顺序.
 
-SharedHashMap<const art::dex::ClassDef *, phmap::flat_hash_set<art::ArtMethod *>>
-    hooked_classes_;
+inline auto& hooked_methods_() {
+    static SharedHashMap<art::ArtMethod *, std::tuple<jobject, art::ArtMethod *, jmethodID>>
+        instance;
+    return instance;
+}
 
-SharedHashSet<art::ArtMethod *> deoptimized_methods_set_;
+inline auto& hooked_classes_() {
+    static SharedHashMap<const art::dex::ClassDef *, phmap::flat_hash_set<art::ArtMethod *>>
+        instance;
+    return instance;
+}
 
-SharedHashMap<const art::dex::ClassDef *, phmap::flat_hash_set<art::ArtMethod *>>
-    deoptimized_classes_;
+inline auto& deoptimized_methods_set_() {
+    static SharedHashSet<art::ArtMethod *> instance;
+    return instance;
+}
 
-SharedHashSet<art::ArtMethod *> backuped_proxy_methods_;
+inline auto& deoptimized_classes_() {
+    static SharedHashMap<const art::dex::ClassDef *, phmap::flat_hash_set<art::ArtMethod *>>
+        instance;
+    return instance;
+}
 
-std::list<std::pair<art::ArtMethod *, art::ArtMethod *>> jit_movements_;
-std::shared_mutex jit_movements_lock_;
+inline auto& backuped_proxy_methods_() {
+    static SharedHashSet<art::ArtMethod *> instance;
+    return instance;
+}
+
+inline auto& jit_movements_() {
+    static std::list<std::pair<art::ArtMethod *, art::ArtMethod *>> instance;
+    return instance;
+}
+
+inline auto& jit_movements_lock_() {
+    static std::shared_mutex instance;
+    return instance;
+}
 
 inline art::ArtMethod *IsHooked(art::ArtMethod * art_method, bool including_backup = false) {
     art::ArtMethod *backup = nullptr;
-    hooked_methods_.if_contains(art_method, [&backup, &including_backup](const auto &it) {
+    hooked_methods_().if_contains(art_method, [&backup, &including_backup](const auto &it) {
         // tuple: (reflected_backup jobject, backup ArtMethod*, backup jmethodID)
         // target 条目：reflected_backup 非 null；backup 条目：reflected_backup = null
         if (including_backup || std::get<0>(it.second)) backup = std::get<1>(it.second);
@@ -124,19 +156,19 @@ inline art::ArtMethod *IsHooked(art::ArtMethod * art_method, bool including_back
 
 inline art::ArtMethod *IsBackup(art::ArtMethod * art_method) {
     art::ArtMethod *backup = nullptr;
-    hooked_methods_.if_contains(art_method, [&backup](const auto &it) {
+    hooked_methods_().if_contains(art_method, [&backup](const auto &it) {
         if (!std::get<0>(it.second)) backup = std::get<1>(it.second);
     });
     return backup;
 }
 
 inline bool IsDeoptimized(art::ArtMethod * art_method) {
-    return deoptimized_methods_set_.contains(art_method);
+    return deoptimized_methods_set_().contains(art_method);
 }
 
 inline std::list<std::pair<art::ArtMethod *, art::ArtMethod *>> GetJitMovements() {
-    std::unique_lock lk(jit_movements_lock_);
-    return std::move(jit_movements_);
+    std::unique_lock lk(jit_movements_lock_());
+    return std::move(jit_movements_());
 }
 
 // shadowhook: 增加 backup_jmethodid 参数——Hook 时在 DoHook 之前（backup 未被 BackupTo
@@ -144,12 +176,12 @@ inline std::list<std::pair<art::ArtMethod *, art::ArtMethod *>> GetJitMovements(
 inline void RecordHooked(art::ArtMethod * target, const art::dex::ClassDef *class_def,
                          jobject reflected_backup, art::ArtMethod *backup,
                          jmethodID backup_jmethodid) {
-    hooked_classes_.lazy_emplace_l(
+    hooked_classes_().lazy_emplace_l(
         class_def, [&target](auto &it) { it.second.emplace(target); },
         [&class_def, &target](const auto &ctor) {
             ctor(class_def, phmap::flat_hash_set<art::ArtMethod *>{target});
         });
-    hooked_methods_.insert(
+    hooked_methods_().insert(
         {std::make_pair(target,
                         std::make_tuple(reflected_backup, backup, backup_jmethodid)),
          // backup 的辅助条目：reflected_backup=null 区分身份，jmethodid 置 nullptr（不使用）
@@ -157,12 +189,12 @@ inline void RecordHooked(art::ArtMethod * target, const art::dex::ClassDef *clas
 }
 
 inline void RecordDeoptimized(const art::dex::ClassDef *class_def, art::ArtMethod *art_method) {
-    { deoptimized_classes_[class_def].emplace(art_method); }
-    deoptimized_methods_set_.insert(art_method);
+    { deoptimized_classes_()[class_def].emplace(art_method); }
+    deoptimized_methods_set_().insert(art_method);
 }
 
 inline void RecordJitMovement(art::ArtMethod * target, art::ArtMethod * backup) {
-    std::unique_lock lk(jit_movements_lock_);
-    jit_movements_.emplace_back(target, backup);
+    std::unique_lock lk(jit_movements_lock_());
+    jit_movements_().emplace_back(target, backup);
 }
 }  // namespace lsplant
