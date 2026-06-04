@@ -112,6 +112,23 @@ inline auto& hooked_methods_() {
     return instance;
 }
 
+/* M4b.3 PTE/UXN 路径：DoHook 装 KPM slot 后存 (target → record)，DoUnHook 拆 KPM slot 时用
+ *   - slot_idx >= 0：PTE 主路径，原始 .oat VA 在 original_oat_va，调
+ *                    shadowhook_pte_uninstall_for_lsplant(slot) + 把 target 的
+ *                    entry_point 还原到 original_oat_va（防 CopyFrom 把
+ *                    pte_backup ghost VA 灌回 target 后该页已 free → 悬空）
+ *   - slot_idx == -2：PTE 失败走了 Dobby fallback，记 original_oat_va 让
+ *                     DoUnHook 调 DobbyDestroy(original_oat_va) 拆 Dobby inline.
+ * 复用 Meyer's singleton 模式与同文件其它全局一致 [M4b.3 R1+R2 P1 修：完整 unhook 语义]. */
+struct PteHookRecord {
+    int32_t  slot_idx;          /* >=0 PTE slot；-2 Dobby fallback；其它无效不应入表 */
+    uint64_t original_oat_va;   /* DoHook 时拷的 target->GetEntryPoint() — DoUnHook 还原用 */
+};
+inline auto& pte_hook_slots_() {
+    static SharedHashMap<art::ArtMethod *, PteHookRecord> instance;
+    return instance;
+}
+
 inline auto& hooked_classes_() {
     static SharedHashMap<const art::dex::ClassDef *, phmap::flat_hash_set<art::ArtMethod *>>
         instance;

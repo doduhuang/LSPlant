@@ -17,6 +17,40 @@ module;
 
 #include "logging.hpp"
 
+/* ============================================================================
+ * shadowhook M4b PTE/UXN integration (M4b.3 fork modification)
+ * ============================================================================
+ * 声明放在 global module fragment（module; … module lsplant; 之间），与其它 #include
+ * 同段——这里的 entity 既属于 global 模块，又被 lsplant 模块 import 后的 DoHook 在
+ * extern "C++"/extern "C" 上下文里能链接到。
+ *
+ * 在 -DLSPLANT_SKIP_ENTRY_POINT_PATCH 构建（M4b 主路径，bridge/CMakeLists.txt 注入）下，
+ * DoHook 不再 `target->SetEntryPoint(entrypoint)`（M4a 原模式），改调本 wrapper:
+ *   - target_oat_va = target->GetEntryPoint()   // 原 .oat 段地址，未被覆盖
+ *   - shadowhook_pte_install_for_lsplant(.oat, entrypoint)
+ *     ↓
+ *   - bridge/lsplant_glue.cpp 内 C-linkage 转 shadowhook::stealth_inline_hooker
+ *     ↓
+ *   - sh_pte_hook_install(target_oat_va, hook_callback_va=entrypoint, pid=getpid(), &slot)
+ *     ↓
+ *   - KPM: PTE.UXN=1 → CPU 取指 trap → do_mem_abort hook 路由到 ghost trampoline
+ *
+ * 由此 ArtMethod 字段 entry_point 不动、目标 .text 字节零修改——RASP「mem-vs-disk」
+ * 比对、ArtMethod 漫游均零痕迹。
+ *
+ * 返回 ghost 内 backup_va（KPM 写好的 PC-relative-already-fixed clone 首指令地址）；
+ * lsplant Java 路径不调它（invoke target 直接走 .oat trap），ArtMethod backup
+ * call-original 也不经此（用 backup ArtMethod 走它自己的 entry_point）。 */
+extern "C" void *shadowhook_pte_install_for_lsplant(void *target, void *hooker);
+
+/* [M4b.3 R1+R2 P1] _ex 版回传 slot_idx + uninstall 由 DoUnHook 调拆 KPM slot 或 Dobby:
+ *   - slot_idx>=0 ：PTE 主路径成功
+ *   - slot_idx==-2：Dobby fallback（DoUnHook 须传 target VA 让 DobbyDestroy 用）
+ *   - slot_idx==-1：完全失败（DoHook 应 return false） */
+extern "C" void *shadowhook_pte_install_for_lsplant_ex(void *target, void *hooker,
+                                                       int *out_slot_idx);
+extern "C" long shadowhook_pte_uninstall_for_lsplant(int slot_idx, void *target_va_for_dobby);
+
 module lsplant;
 
 import dex_builder;
@@ -556,7 +590,56 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
 
         target->SetNonCompilable();
 
-        target->SetEntryPoint(entrypoint);
+#ifdef LSPLANT_SKIP_ENTRY_POINT_PATCH
+        /* ============================================================
+         * M4b PTE/UXN 主路径（shadowhook fork mod，bridge/CMakeLists.txt 经
+         * `-DLSPLANT_SKIP_ENTRY_POINT_PATCH` 注入；M4a Dobby 原路径见 #else 分支）
+         * ============================================================
+         * 不改 target 的 ArtMethod.entry_point 字段（保留原 .oat 段地址）；改为
+         * 显式调 shadowhook_pte_install_for_lsplant_ex 把 target.entry_point 指向的
+         * .oat VA 作 PTE hook target，hooker = trampoline entrypoint（由 lsplant
+         * GenerateTrampolineFor(hook) 生成；M4a 即 Dobby 走 ghost trampoline 页）。
+         *
+         * 此后 Java invoke target 走原 .oat 段 → CPU ifetch UXN trap → KPM
+         * before_do_mem_abort → 改 pt_regs.pc 跳 ghost trampoline → callback。
+         *
+         * **[M4b.3 R1 P1-A 修] call-original 修复**：
+         *   先前版本 `(void)pte_backup` 丢掉了 KPM 返的 ghost backup_va。问题：
+         *   BackupTo(backup) 把 target 的字段（含 entry_point=.oat_va）拷给 backup；
+         *   ArtMethod backup 仍指向 .oat 段；但 .oat 现在 PTE.UXN=1 → ART 调
+         *   backup（即 call_original）会重入 hook → 递归。修法：把 backup 的
+         *   entry_point 改成 ghost 里的 backup_va（DBI 已修过 PC-相对指令的原首
+         *   指令位置），call_original 跳进 ghost 直接跑原指令，不触发 trap.
+         *   ghost 页本身 UXN=0（独立 VMA），合法 exec.
+         *
+         * **[M4b.3 R1 P1-B 修] slot tracking**：
+         *   _ex 版回传 slot_idx；存入 pte_hook_slots_(target) → DoUnHook 用同 key
+         *   查回再调 shadowhook_pte_uninstall_for_lsplant 拆 KPM 端 slot. */
+        uint64_t target_oat_va = reinterpret_cast<uint64_t>(target->GetEntryPoint());
+        int pte_slot = -1;
+        void *pte_backup = shadowhook_pte_install_for_lsplant_ex(
+                              reinterpret_cast<void *>(target_oat_va), entrypoint, &pte_slot);
+        if (!pte_backup) {
+            LOGE("M4b PTE shadowhook_pte_install_for_lsplant_ex(.oat=%p, entrypoint=%p) failed slot=%d",
+                 (void *)target_oat_va, entrypoint, pte_slot);
+            return false;
+        }
+        /* [P1-A 修] PTE 路径让 call_original 走 ghost 而非 .oat trap (避免重入)；
+         * Dobby fallback 路径 backup_va = Dobby origin (M4a 既有语义)，同样把 backup
+         * 指过去 — 上游 M4a 既如此 (DobbyHook origin → backup entry_point)，沿用. */
+        backup->SetEntryPoint(pte_backup);
+        /* [P1-B+P1-C+P1-D 修] 跟踪 (slot_idx, original_oat_va) 供 DoUnHook:
+         *   - PTE 主路径：DoUnHook 调 uninstall + 把 target.entry_point 还原到 original_oat_va
+         *     (防 CopyFrom 把 pte_backup ghost VA 灌回 target，但 ghost 页已 free → 悬空崩)
+         *   - Dobby fallback：DoUnHook 调 DobbyDestroy(target_oat_va) 拆 inline patch.
+         * pte_slot == -1 表 install 完全失败，但本路径 pte_backup==null 已 return false，
+         * 不会走到这里. */
+        if (pte_slot >= 0 || pte_slot == -2 /* kSlotFallbackDobby */) {
+            pte_hook_slots_().insert({target, {pte_slot, target_oat_va}});
+        }
+#else
+        target->SetEntryPoint(entrypoint);   /* M4a 原路径：改 entry_point 到 trampoline */
+#endif
 
         LOGV("Done hook: target(%p:0x%x) -> %p; backup(%p:0x%x) -> %p; hook(%p:0x%x) -> %p", target,
              target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
@@ -571,6 +654,60 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);
     LOGV("Unhooking: target = %p, backup = %p", target, backup);
+#ifdef LSPLANT_SKIP_ENTRY_POINT_PATCH
+    /* [M4b.3 R1+R2 P1 修] 拆 hook (PTE 主路径 / Dobby fallback) + 还原 target.entry_point。
+     *
+     * 顺序：
+     *   1. 查 pte_hook_slots_(target) 拿 (slot_idx, original_oat_va)
+     *   2. PTE 路径：shadowhook_pte_uninstall_for_lsplant 拆 KPM slot + 释放 ghost 页
+     *               Dobby 路径：DobbyDestroy 拆 inline patch (target_va_for_dobby=original_oat_va)
+     *   3. **关键 [R2 P1-C 修]**：把 backup.entry_point 改回 original_oat_va，让接下来
+     *      CopyFrom 把"原始 .oat VA"灌回 target，而不是悬空的 ghost VA（已 free）.
+     *   4. CopyFrom 由上游既有 lsplant 逻辑做：把整个 backup（含修正后的 entry_point）拷回 target.
+     *   5. 上游 CopyFrom 后调 SetAccessFlags 还原 access_flags. */
+    int slot_for_target = -1;
+    uint64_t original_oat_va = 0;
+    pte_hook_slots_().if_contains(target, [&slot_for_target, &original_oat_va](const auto &it) {
+        slot_for_target = it.second.slot_idx;
+        original_oat_va = it.second.original_oat_va;
+    });
+    if (slot_for_target >= 0 || slot_for_target == -2 /* kSlotFallbackDobby */) {
+        long rc = shadowhook_pte_uninstall_for_lsplant(
+                      slot_for_target,
+                      reinterpret_cast<void *>(original_oat_va));
+        if (rc != 0) {
+            /* [R3+R4 P1-F+codex 反复 trade-off]:
+             * uninstall 失败的现实困境：
+             *   选项A "DoUnHook 返 false 让上层 hooked_methods_ 保留"——不行：lsplant 上游
+             *      `UnHook` (line ~890-906) 在 DoUnHook 之前已 `erase_if(hooked_methods_)` +
+             *      `erase(backup)` + `erase(hooked_classes_)`+ `DeleteGlobalRef(reflected_backup)`，
+             *      到达 DoUnHook 时上层追踪已全清，返 false 也救不回 LSPlant 视角；
+             *      只是让 DoUnHook 自己的 pte_hook_slots_ 表保留——单点保留意义有限.
+             *   选项B 继续往下 erase + restore entry_point——风险：target 页仍 UXN-armed
+             *      但 do_mem_abort handler 仍调原 ghost trampoline；trampoline 仍在原位
+             *      （uninstall 失败 → ghost 未 free → trampoline 还能跑）→ hook 仍生效；
+             *      但 LSPlant 视角已"unhooked"——掉子状态不一致.
+             *
+             * 当前选 B（continue + 大声 log + erase）：至少 user 视角内 lsplant_hook_slots_
+             * 不留悬空记录；且因 ghost 仍在（uninstall 失败常意味着 KPM 端没释放 → ghost
+             * 仍 valid），target 上 Java 方法仍被 hook 但不崩；至少**安全失败**。
+             *
+             * 真正的根治需要把 UnHook 上层的 erase 移到 DoUnHook 之后（M4b.4+ 上游拍板）. */
+            LOGE("M4b uninstall failed rc=%ld slot=%d target=%p — PERMANENT LEAK; "
+                 "hook may remain active even after UnHook returns true",
+                 rc, slot_for_target, target);
+            /* fallthrough: erase 跟踪 + restore entry_point. */
+        }
+        /* [R2 P1-C 修] 还原 backup.entry_point → original_oat_va：
+         * - PTE 路径：pte_backup ghost VA 可能已被 uninstall 释放（成功路径）或仍在（失败路径）
+         * - Dobby 路径：origin 指向 Dobby 跳板内 backup 区，DobbyDestroy 拆后跳板可能被释放
+         * - 统一改回 original_oat_va 最安全（成功路径下 .oat PTE 已 restore UXN=0，正常可执行；
+         *   失败路径下虽然不"最佳"但比悬空指针好）.
+         * call_original 之后用 backup 调用：原 .oat 段（成功路径 PTE restore UXN=0）安全可执行. */
+        backup->SetEntryPoint(reinterpret_cast<void *>(original_oat_va));
+        pte_hook_slots_().erase(target);
+    }
+#endif
     auto access_flags = target->GetAccessFlags();
     target->CopyFrom(backup);
     target->SetAccessFlags(access_flags);
