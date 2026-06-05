@@ -5,6 +5,7 @@ module;
 #include <android/api-level.h>
 #include <bits/sysconf.h>
 #include <jni.h>
+#include <sched.h>  /* M4b-Polish I3 codex T1 round 4: sched_yield for transient EBUSY retry */
 #include <sys/mman.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
@@ -676,9 +677,17 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
         original_oat_va = it.second.original_oat_va;
     });
     if (slot_for_target >= 0 || slot_for_target == -2 /* kSlotFallbackDobby */) {
-        long rc = shadowhook_pte_uninstall_for_lsplant(
-                      slot_for_target,
-                      reinterpret_cast<void *>(original_oat_va));
+        /* M4b-Polish I3 (codex T1 round 4 P2): rc==-EBUSY (-16) 通常是 transient (并发 install 在
+         * Step 5 短暂 reserved=true 扫 used slot 时撞上). 重试 4 次 (yield via sched_yield)
+         * 再认 stuck. install Step 5 hold reserved 仅 ~10 instr，4 次让出 CPU 足以解锁. */
+        long rc = 0;
+        for (int retry = 0; retry < 4; retry++) {
+            rc = shadowhook_pte_uninstall_for_lsplant(
+                     slot_for_target,
+                     reinterpret_cast<void *>(original_oat_va));
+            if (rc != -16 /* -EBUSY */) break;
+            sched_yield();
+        }
         if (rc != 0) {
             /* [M4b-Polish I3 fix, codex round 4+5 P2]: uninstall 失败现实困境的两层处理：
              *
