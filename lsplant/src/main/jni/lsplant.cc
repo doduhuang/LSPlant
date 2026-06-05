@@ -749,6 +749,9 @@ using ::lsplant::IsHooked;
     auto *target = ArtMethod::FromReflectedMethod(env, target_method);
     jobject reflected_backup = nullptr;
     art::ArtMethod *backup = nullptr;
+    // Atomic claim: erase_if removes the entry and captures its value in one step.
+    // Concurrent UnHook(same target) callers race here: only one wins erase_if and
+    // proceeds; the other sees the entry already gone and returns false below.
     if (!hooked_methods_.erase_if(target, [&reflected_backup, &backup](const auto &it) {
             std::tie(reflected_backup, backup) = it.second;
             return reflected_backup != nullptr;
@@ -756,26 +759,49 @@ using ::lsplant::IsHooked;
         LOGE("Unable to unhook a method that is not hooked");
         return false;
     }
-    // FIXME: not atomic, but should be fine
+    // Call DoUnHook on the claimed (target, backup). We deliberately drop the lock-free
+    // rollback that an earlier draft of this PR carried: it raced with concurrent
+    // Hook(target) attempts on the rolled-back state. With no rollback there are no
+    // race scenarios to reason about — no re-insertion attempt, no salvage path.
+    //
+    // Trade-off on the DoUnHook-false path: 3-map entries + JNI ref for the old
+    // backup leak compared to upstream HEAD (which cleans them up unconditionally
+    // before DoUnHook). More importantly, hooked_methods_(target) is gone but the
+    // trampoline installed by DoHook remains in place, so a subsequent IsHooked(target)
+    // returns "not hooked" while EntryPoint still routes through the trampoline. Any
+    // future failable DoUnHook backend MUST add its own caller-side tracking to refuse
+    // Hook(target) until that leak is cleared. Since upstream DoUnHook today returns
+    // true unconditionally, this trade-off has NO runtime effect on current users.
+    if (!DoUnHook(target, backup)) {
+        return false;   // No rollback, no cleanup — see trade-off note above.
+    }
+    // Success path (DoUnHook true): cleanup OLD backup's 3-map entries + JNI ref + propagate.
+    // FIXME: not atomic, but should be fine — same caveat as upstream's original
+    //        comment. The cross-map inconsistency window between the
+    //        hooked_methods_(target) erase above and the three erases below is wider
+    //        than upstream HEAD's because it now spans DoUnHook. Inside that span the
+    //        DoUnHook body itself runs under ScopedSuspendAll + ScopedGCCriticalSection,
+    //        but the cleanup erases below run after DoUnHook returns, so concurrent
+    //        Hook/IsHooked callers can still observe the partially-updated maps just
+    //        as they could pre-PR (the "FIXME: not atomic" rationale is unchanged).
+    // JNI use-after-delete protection: FromReflectedMethod MUST be called BEFORE
+    // DeleteGlobalRef on the same reflected_backup ref.
     hooked_methods_.erase(backup);
     backuped_proxy_methods_.erase(backup);
     hooked_classes_.erase_if(target->GetDeclaringClass()->GetClassDef(), [&target](auto &it) {
         it.second.erase(target);
         return it.second.empty();
     });
-    auto *backup_method = env->FromReflectedMethod(reflected_backup);
+    auto *backup_method = env->FromReflectedMethod(reflected_backup);   // BEFORE DeleteGlobalRef
     env->DeleteGlobalRef(reflected_backup);
-    if (DoUnHook(target, backup)) {
-        std::apply(
-            [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
-                ((*v == backup_method && (LOGD("Propagate internal used method because of unhook"),
-                                          *v = target_method_id)) ||
-                 ...);
-            },
-            kInternalMethods);
-        return true;
-    }
-    return false;
+    std::apply(
+        [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
+            ((*v == backup_method && (LOGD("Propagate internal used method because of unhook"),
+                                      *v = target_method_id)) ||
+             ...);
+        },
+        kInternalMethods);
+    return true;
 }
 
 [[maybe_unused]] bool IsHooked(JNIEnv *env, jobject method) {
