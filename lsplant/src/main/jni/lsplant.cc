@@ -18,6 +18,12 @@ module;
 
 #include "logging.hpp"
 
+/* M4b-Polish T3 I2: 共享 slot sentinel 常量。优先 quoted-include 解析 jni/ 同目录的
+ * vendored 副本（让 lsplant fork standalone build 工作）；shadowhook build 因
+ * bridge/CMakeLists.txt 对 lsplant_static 暴露 SH_ROOT/include，但 quoted-include 也
+ * 优先 jni/ 副本（与 canonical 等价 → 单源对外行为一致）。改 ABI 时必须同步更新两份。 */
+#include "shadowhook_lsplant_abi.h"
+
 /* ============================================================================
  * shadowhook M4b PTE/UXN integration (M4b.3 fork modification)
  * ============================================================================
@@ -621,7 +627,7 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          *   _ex 版回传 slot_idx；存入 pte_hook_slots_(target) → DoUnHook 用同 key
          *   查回再调 shadowhook_pte_uninstall_for_lsplant 拆 KPM 端 slot. */
         uint64_t target_oat_va = reinterpret_cast<uint64_t>(target->GetEntryPoint());
-        int pte_slot = -1;
+        int pte_slot = SHADOWHOOK_SLOT_INVALID;
         void *pte_backup = shadowhook_pte_install_for_lsplant_ex(
                               reinterpret_cast<void *>(target_oat_va), entrypoint, &pte_slot);
         if (!pte_backup) {
@@ -637,9 +643,9 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          *   - PTE 主路径：DoUnHook 调 uninstall + 把 target.entry_point 还原到 original_oat_va
          *     (防 CopyFrom 把 pte_backup ghost VA 灌回 target，但 ghost 页已 free → 悬空崩)
          *   - Dobby fallback：DoUnHook 调 DobbyDestroy(target_oat_va) 拆 inline patch.
-         * pte_slot == -1 表 install 完全失败，但本路径 pte_backup==null 已 return false，
-         * 不会走到这里. */
-        if (pte_slot >= 0 || pte_slot == -2 /* kSlotFallbackDobby */) {
+         * pte_slot == SHADOWHOOK_SLOT_INVALID 表 install 完全失败，但本路径 pte_backup==null
+         * 已 return false，不会走到这里. */
+        if (pte_slot >= 0 || pte_slot == SHADOWHOOK_SLOT_FALLBACK_DOBBY) {
             pte_hook_slots_().insert({target, {pte_slot, target_oat_va}});
         }
 #else
@@ -670,13 +676,13 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
      *      CopyFrom 把"原始 .oat VA"灌回 target，而不是悬空的 ghost VA（已 free）.
      *   4. CopyFrom 由上游既有 lsplant 逻辑做：把整个 backup（含修正后的 entry_point）拷回 target.
      *   5. 上游 CopyFrom 后调 SetAccessFlags 还原 access_flags. */
-    int slot_for_target = -1;
+    int slot_for_target = SHADOWHOOK_SLOT_INVALID;
     uint64_t original_oat_va = 0;
     pte_hook_slots_().if_contains(target, [&slot_for_target, &original_oat_va](const auto &it) {
         slot_for_target = it.second.slot_idx;
         original_oat_va = it.second.original_oat_va;
     });
-    if (slot_for_target >= 0 || slot_for_target == -2 /* kSlotFallbackDobby */) {
+    if (slot_for_target >= 0 || slot_for_target == SHADOWHOOK_SLOT_FALLBACK_DOBBY) {
         /* M4b-Polish I3 (codex T1 round 4 P2): rc==-EBUSY (-16) 通常是 transient (并发 install 在
          * Step 5 短暂 reserved=true 扫 used slot 时撞上). 重试 4 次 (yield via sched_yield)
          * 再认 stuck. install Step 5 hold reserved 仅 ~10 instr，4 次让出 CPU 足以解锁. */
@@ -696,7 +702,7 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
              *      LSPlant 视角已"unhooked"但 KPM hook 仍生效；可通过 SH_CMD_PTE_HOOK_STUCK_COUNT
              *      0x7006 查询 stuck 总数, controller 决定是否 kill app + reload KPM.
              *
-             *   ② Dobby fallback (slot_for_target == -2)：rc 来自 DobbyDestroy. 与 PTE telemetry
+             *   ② Dobby fallback (slot_for_target == SHADOWHOOK_SLOT_FALLBACK_DOBBY)：rc 来自 DobbyDestroy. 与 PTE telemetry
              *      无关，不走 force_recycle. Dobby far trampoline 可能 leak.
              *
              * 真正的根治需要把 UnHook 上层的 erase 移到 DoUnHook 之后 (lsplant 上游 PR). */
