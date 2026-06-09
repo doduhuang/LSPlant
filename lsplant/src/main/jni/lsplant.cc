@@ -311,6 +311,23 @@ inline void UpdateTrampoline(uint8_t offset) {
 }
 
 bool InitNative(JNIEnv *env, const HookHandler &handler) {
+    // ① Resolve ScopedSuspendAll ctor/dtor symbols FIRST (chicken-and-egg):
+    // ScopedSuspendAll::Init() only installs 2 inline hooks on ART internals
+    // (constructor_ and destructor_), which are NOT called during the App's
+    // class-init storm, so these 2 hooks are race-safe without a guard.
+    if (!ScopedSuspendAll::Init(handler)) {
+        LOGE("Failed to init scoped suspend all");
+        return false;
+    }
+    // ② M4b.4-fu: stop-the-world guard for the remaining inline-hook installation.
+    // When LSPlant is dlopen()-injected into a running multi-threaded App,
+    // Dobby's non-atomic 22–24-byte prologue writes on libart symbols
+    // (FixupStaticTrampolines*, ClassLinker::InitializeClass, etc.) race with
+    // App threads already executing those functions during a class-init storm,
+    // causing garbage SP/LR control flow → SIGSEGV.
+    // long_suspend=false: estimated duration ~150–300 µs (35 hooks × ~5–10 µs),
+    // far below the 5 s ANR threshold.
+    ScopedSuspendAll guard("LSPlant InitNative", false);
     if (!ArtMethod::Init(env, handler)) {
         LOGE("Failed to init art method");
         return false;
@@ -330,10 +347,6 @@ bool InitNative(JNIEnv *env, const HookHandler &handler) {
     }
     if (!ClassLinker::Init(env, handler)) {
         LOGE("Failed to init class linker");
-        return false;
-    }
-    if (!ScopedSuspendAll::Init(handler)) {
-        LOGE("Failed to init scoped suspend all");
         return false;
     }
     if (!ScopedGCCriticalSection::Init(handler)) {
