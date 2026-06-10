@@ -57,7 +57,7 @@ struct InitInfo {
     /// \brief The generated source name. Could be empty.
     std::string_view generated_source_name = "LSP";
     /// \brief The generated field name. Must not be empty.
-    std::string_view generated_field_name = "hooker";
+    std::string_view generated_field_name = "impl";
     /// \brief The generated class name. Must not be empty. If {target} is set,
     /// it will follows the name of the target.
     std::string_view generated_method_name = "{target}";

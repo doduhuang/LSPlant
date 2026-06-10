@@ -169,15 +169,6 @@ std::string generated_method_name;
 static InitInfo::MemMapFunType   g_mem_map   = nullptr;
 static InitInfo::MemUnmapFunType g_mem_unmap = nullptr;
 
-/* anti-detection follow-up ②: InMemoryDexClassLoader 路径缓存（InitJNI 时初始化）。
- * T0 probe 真机确认 Unsafe.defineAnonymousClass 在 Android 13 不存在（commit 7c90eaa），
- * 改 IMDCL 方案（API 26+，公开 API，无 hidden-API 限制）替代 PathClassLoader(".")。  */
-static jclass    g_imdcl_class    = nullptr;  /* global ref — dalvik/system/InMemoryDexClassLoader */
-static jmethodID g_imdcl_ctor     = nullptr;  /* <init>(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V */
-static jclass    g_bb_class       = nullptr;  /* global ref — java/nio/ByteBuffer */
-static jmethodID g_bb_wrap        = nullptr;  /* ByteBuffer.wrap([B)Ljava/nio/ByteBuffer; (static) */
-static jmethodID g_load_class_mid = nullptr;  /* ClassLoader.loadClass(Ljava/lang/String;)Ljava/lang/Class; */
-
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
         LOGE("generated class name cannot be empty");
@@ -310,42 +301,6 @@ bool InitJNI(JNIEnv *env) {
         LOGE("Failed to find AccessibleObject.setAccessible");
         return false;
     }
-
-    /* anti-detection follow-up ②: InMemoryDexClassLoader + ByteBuffer + ClassLoader.loadClass 初始化。
-     * 替代 BuildDex 中 PathClassLoader(".", callback_class_loader) 路径，
-     * 消除 ART CL 树中可疑 PathClassLoader(".")节点。
-     *
-     * 只在 API >= 26（Android O）初始化：API 21-25 没有 InMemoryDexClassLoader，
-     * 那些设备走 BuildDex 的旧 DexFile 路径（g_imdcl_class 保持 nullptr，BuildDex 按 sdk_int 分支）。
-     * codex P2 fix：不再 fail-closed on API < 26，保留向后兼容路径。  */
-    if (sdk_int >= __ANDROID_API_O__) {
-        /* java.nio.ByteBuffer (for ByteBuffer.wrap static method) */
-        auto bb_class = JNI_FindClass(env, "java/nio/ByteBuffer");
-        if (!bb_class) { LOGE("Failed to find ByteBuffer"); return false; }
-        g_bb_class = JNI_NewGlobalRef(env, bb_class);
-        g_bb_wrap = JNI_GetStaticMethodID(env, bb_class, "wrap",
-                                           "([B)Ljava/nio/ByteBuffer;");
-        if (!g_bb_wrap) { LOGE("Failed to find ByteBuffer.wrap"); return false; }
-
-        /* dalvik.system.InMemoryDexClassLoader(ByteBuffer, ClassLoader) — API 26+ */
-        auto imdcl_class = JNI_FindClass(env, "dalvik/system/InMemoryDexClassLoader");
-        if (!imdcl_class) {
-            LOGE("Failed to find InMemoryDexClassLoader (API 26+ required)");
-            return false;
-        }
-        g_imdcl_class = JNI_NewGlobalRef(env, imdcl_class);
-        g_imdcl_ctor = JNI_GetMethodID(env, imdcl_class, "<init>",
-            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-        if (!g_imdcl_ctor) { LOGE("Failed to find IMDCL ctor"); return false; }
-
-        /* java.lang.ClassLoader.loadClass(String)Class */
-        auto cl_class = JNI_FindClass(env, "java/lang/ClassLoader");
-        if (!cl_class) { LOGE("Failed to find ClassLoader"); return false; }
-        g_load_class_mid = JNI_GetMethodID(env, cl_class, "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;");
-        if (!g_load_class_mid) { LOGE("Failed to find ClassLoader.loadClass"); return false; }
-    }
-
     return true;
 }
 
@@ -520,96 +475,44 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
 
     jclass target_class = nullptr;
 
-    /* anti-detection follow-up ②: InMemoryDexClassLoader 替代 PathClassLoader（API >= 26）。
-     * 原 PathClassLoader(".", callback_class_loader) 在 ART CL 树插入可疑节点；
-     * app CL 可遍历到该节点，findLoadedClasses 可见 "LSPHooker_" 类。
-     *
-     * 新路径（API >= 26）：bytes → ByteBuffer.wrap → IMDCL(buf, class_loader parent) → loadClass
-     *   IMDCL(parent=callback_class_loader) — app CL 是 IMDCL 的 parent，loadClass 从 app→bootstrap
-     *   向上委托，不向下递归子 loader，故 app_CL.loadClass("MethodCallback") → ClassNotFoundException。
-     *   同时 IMDCL 以 class_loader 为 parent，可解析生成 DEX 引用的 hooker 类型。
-     *   (codex P1 fix: 原 null-parent 无法解析 hooker_class 等 app 类型引用)
-     * T0 probe 2026-06-10: Unsafe.defineAnonymousClass Android 13 不存在 → 改 IMDCL。
-     *
-     * API < 26 fallback（g_imdcl_class == nullptr）：退回旧 PathClassLoader + DexFile 路径。
-     * (codex P2 fix: 保留向后兼容，不让 API 21-25 设备在 InitJNI 失败)  */
-    if (g_imdcl_class) {
-        /* 1. C++ slicer DEX bytes (slicer::MemView) → jbyteArray。
-         * image.ptr()/image.size() 在本作用域内有效；env->NewByteArray 无 JNI 包装，直接调。 */
-        jbyteArray raw_bytes = env->NewByteArray(static_cast<jsize>(image.size()));
-        if (!raw_bytes) {
-            LOGE("BuildDex: NewByteArray(%zu) failed (OOM?)", image.size());
-            return {nullptr, nullptr, nullptr, nullptr};
-        }
-        ScopedLocalRef<jbyteArray> dex_bytes(env, raw_bytes);
-        env->SetByteArrayRegion(raw_bytes, 0, static_cast<jsize>(image.size()),
-                                reinterpret_cast<const jbyte *>(image.ptr()));
+    ScopedLocalRef<jobject> java_dex_file{nullptr};
 
-        /* 2. ByteBuffer.wrap(bytes) — static 方法，用 JNI_CallStaticObjectMethod。 */
-        auto bb = JNI_CallStaticObjectMethod(env, g_bb_class, g_bb_wrap, raw_bytes);
-        if (!bb) {
-            LOGE("BuildDex: ByteBuffer.wrap failed");
-            return {nullptr, nullptr, nullptr, nullptr};
-        }
-
-        /* 3. new InMemoryDexClassLoader(bb, class_loader)。
-         * 用 callback 的 class_loader 为 IMDCL parent：IMDCL 加载的类不向上暴露给 app CL 链
-         * (parent 委托方向是向上，app_CL.loadClass 不向下递归子 loader)，同时能解析 hooker 类型。
-         * codex P1 fix: null parent → class_loader parent。                               */
-        auto imdcl = JNI_NewObject(env, g_imdcl_class, g_imdcl_ctor,
-                                    bb.get(),
-                                    class_loader);
-        if (!imdcl) {
-            LOGE("BuildDex: IMDCL ctor failed");
-            return {nullptr, nullptr, nullptr, nullptr};
-        }
-
-        /* 4. imdcl.loadClass("MethodCallback") → Hooker class。 */
-        target_class = JNI_Cast<jclass>(
-            JNI_CallObjectMethod(env, imdcl, g_load_class_mid,
-                                 JNI_NewStringUTF(env, generated_class_name.data()))).release();
-        if (!target_class) {
-            LOGE("BuildDex: IMDCL.loadClass('%s') failed", generated_class_name.data());
-            return {nullptr, nullptr, nullptr, nullptr};
-        }
+    if (auto dex_file_class = JNI_FindClass(env, "dalvik/system/DexFile"); dex_file_init_with_cl) {
+        java_dex_file = JNI_NewObject(
+            env, dex_file_class, dex_file_init_with_cl,
+            JNI_NewObjectArray(
+                env, 1, JNI_FindClass(env, "java/nio/ByteBuffer"),
+                JNI_NewDirectByteBuffer(env, const_cast<void *>(image.ptr()), image.size())),
+            nullptr, nullptr);
+    } else if (dex_file_init) {
+        java_dex_file = JNI_NewObject(
+            env, dex_file_class, dex_file_init,
+            JNI_NewDirectByteBuffer(env, const_cast<void *>(image.ptr()), image.size()));
     } else {
-        /* API 21-25 fallback：旧 PathClassLoader + DexFile 路径（codex P2 保留向后兼容）。 */
-        ScopedLocalRef<jobject> java_dex_file{nullptr};
-        if (auto dex_file_class = JNI_FindClass(env, "dalvik/system/DexFile"); dex_file_init_with_cl) {
-            java_dex_file = JNI_NewObject(
-                env, dex_file_class, dex_file_init_with_cl,
-                JNI_NewObjectArray(
-                    env, 1, JNI_FindClass(env, "java/nio/ByteBuffer"),
-                    JNI_NewDirectByteBuffer(env, const_cast<void *>(image.ptr()), image.size())),
-                nullptr, nullptr);
-        } else if (dex_file_init) {
-            java_dex_file = JNI_NewObject(
-                env, dex_file_class, dex_file_init,
-                JNI_NewDirectByteBuffer(env, const_cast<void *>(image.ptr()), image.size()));
+        void *target =
+            mmap(nullptr, image.size(), PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        memcpy(target, image.ptr(), image.size());
+        mprotect(target, image.size(), PROT_READ);
+        std::string err_msg;
+        const auto *dex = DexFile::OpenMemory(
+            reinterpret_cast<const uint8_t *>(target), image.size(),
+            generated_source_name.empty() ? "lsplant" : generated_source_name, &err_msg);
+        if (!dex) {
+            LOGE("Failed to open memory dex: %s", err_msg.data());
         } else {
-            void *target =
-                mmap(nullptr, image.size(), PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-            memcpy(target, image.ptr(), image.size());
-            mprotect(target, image.size(), PROT_READ);
-            std::string err_msg;
-            const auto *dex = DexFile::OpenMemory(
-                reinterpret_cast<const uint8_t *>(target), image.size(),
-                generated_source_name.empty() ? "lsplant" : generated_source_name, &err_msg);
-            if (!dex) {
-                LOGE("Failed to open memory dex: %s", err_msg.data());
-            } else {
-                java_dex_file = ScopedLocalRef(env, dex ? dex->ToJavaDexFile(env) : nullptr);
-            }
+            java_dex_file = ScopedLocalRef(env, dex ? dex->ToJavaDexFile(env) : nullptr);
         }
-        if (auto path_class_loader = JNI_FindClass(env, "dalvik/system/PathClassLoader");
-            java_dex_file) {
-            auto my_cl = JNI_NewObject(env, path_class_loader, path_class_loader_init,
-                                       JNI_NewStringUTF(env, "."), class_loader);
-            target_class = JNI_Cast<jclass>(
+    }
+
+    if (auto path_class_loader = JNI_FindClass(env, "dalvik/system/PathClassLoader");
+        java_dex_file) {
+        auto my_cl = JNI_NewObject(env, path_class_loader, path_class_loader_init,
+                                   JNI_NewStringUTF(env, "."), class_loader);
+        target_class =
+            JNI_Cast<jclass>(
                 JNI_CallObjectMethod(env, java_dex_file, load_class,
-                                     JNI_NewStringUTF(env, generated_class_name.data()),
-                                     my_cl)).release();
-        }
+                                     JNI_NewStringUTF(env, generated_class_name.data()), my_cl))
+                .release();
     }
 
     if (target_class) {
