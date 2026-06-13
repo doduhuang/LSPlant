@@ -62,6 +62,18 @@ extern "C" long shadowhook_pte_uninstall_for_lsplant(int slot_idx, void *target_
  * (PTE 仍 UXN-armed + do_mem_abort handler 仍服务防 SIGSEGV). 仅 telemetry. */
 extern "C" void shadowhook_pte_force_recycle_slot_for_lsplant(int slot_idx);
 
+#ifdef LSPLANT_M6_BACKEND
+/* M6b: DoHook installs an M6 PTE/UXN slot; DoUnHook uninstalls it.
+ * Implemented in bridge/lsplant_glue.cpp (C linkage wrappers over sh_m6_*).
+ * install: target_oat_va = ArtMethod entry_point VA; trampoline_va = shellcode VA;
+ *          *slot_out ≥0 = success.  Returns 0 on success.
+ * uninstall: slot_idx ≥0.  Returns 0 on success. */
+extern "C" int shadowhook_m6_install_for_lsplant(void *target_oat_va,
+                                                   void *trampoline_va,
+                                                   int32_t *slot_out);
+extern "C" int shadowhook_m6_uninstall_for_lsplant(int32_t slot_idx);
+#endif  /* LSPLANT_M6_BACKEND */
+
 module lsplant;
 
 import dex_builder;
@@ -595,9 +607,15 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
 }
 
 bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
+#ifndef LSPLANT_M6_BACKEND
+    /* ScopedSuspendAll/ScopedGCCriticalSection are initialized by InitNative
+     * (via ScopedSuspendAll::Init). M6b skips InitNative (no Dobby on libart),
+     * so these objects cannot be constructed.  M6b uses direct KPM PTE/UXN
+     * install which does not require ART suspension. */
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);
+#endif  /* LSPLANT_M6_BACKEND */
     LOGV("Hooking: target = %s(%p), hook = %s(%p), backup = %s(%p)", target->PrettyMethod().c_str(),
          target, hook->PrettyMethod().c_str(), hook, backup->PrettyMethod().c_str(), backup);
 
@@ -614,7 +632,44 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
 
         target->SetNonCompilable();
 
-#ifdef LSPLANT_SKIP_ENTRY_POINT_PATCH
+#ifdef LSPLANT_M6_BACKEND
+        /* ============================================================
+         * M6b PTE/UXN 主路径：直接在 OAT/JIT 页 PTE.UXN=1；不改 ArtMethod.entry_point。
+         * 不需要 Dobby (InitNative 被 Init() 跳过)。
+         *
+         * 顺序：
+         *   1. 保存 target 原 OAT entry_point（BackupTo 之前，尚未被覆写）。
+         *   2. 调 shadowhook_m6_install_for_lsplant：KPM SH_CMD_M6_SIMPLE_HOOK
+         *      把 OAT 页 PTE.UXN=1；fault 时改 pc → trampoline（GenerateTrampolineFor(hook)）。
+         *   3. 把 backup 的 entry_point 改成 ART interpreter 入口
+         *      (ClassLinker::SetEntryPointsToInterpreter)，使 cb.backup.invoke() 走
+         *      DEX bytecode 执行，而不经过 UXN-armed OAT 页（避免重入 hook）。
+         *   4. 记录 (target → {slot_idx, original_oat_va}) 供 DoUnHook 还原。
+         * ============================================================ */
+
+        /* Step 1: 捕获原始 OAT entry_point（BackupTo 之前，字段还未被覆写） */
+        uint64_t target_oat_va = reinterpret_cast<uint64_t>(target->GetEntryPoint());
+
+        /* Step 2: 安装 M6 PTE/UXN hook */
+        int32_t m6_slot = -1;
+        int m6_rc = shadowhook_m6_install_for_lsplant(
+            reinterpret_cast<void *>(target_oat_va), entrypoint, &m6_slot);
+        if (m6_rc != 0 || m6_slot < 0) {
+            LOGE("M6b DoHook: shadowhook_m6_install_for_lsplant(.oat=%p, trampoline=%p)"
+                 " failed rc=%d slot=%d",
+                 (void *)target_oat_va, entrypoint, m6_rc, m6_slot);
+            return false;
+        }
+
+        /* Step 3: backup entry_point → ART interpreter
+         * call_original (cb.backup.invoke) 走 interpreter DEX 路径，不触发 UXN trap。
+         * ClassLinker::SetEntryPointsToInterpreter 由 import :class_linker 提供。 */
+        ClassLinker::SetEntryPointsToInterpreter(backup);
+
+        /* Step 4: 记录 slot + original VA 供 DoUnHook */
+        m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va}});
+
+#elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
         /* ============================================================
          * M4b PTE/UXN 主路径（shadowhook fork mod，bridge/CMakeLists.txt 经
          * `-DLSPLANT_SKIP_ENTRY_POINT_PATCH` 注入；M4a Dobby 原路径见 #else 分支）
@@ -674,11 +729,48 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
 }
 
 bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
+#ifndef LSPLANT_M6_BACKEND
+    /* Same rationale as DoHook: ScopedSuspendAll requires InitNative, which M6b skips. */
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);
+#endif  /* LSPLANT_M6_BACKEND */
     LOGV("Unhooking: target = %p, backup = %p", target, backup);
-#ifdef LSPLANT_SKIP_ENTRY_POINT_PATCH
+#ifdef LSPLANT_M6_BACKEND
+    /* M6b DoUnHook: uninstall KPM slot + restore backup entry_point → original OAT VA
+     * (so the subsequent CopyFrom propagates the correct VA back to target).
+     *
+     * Note: target's entry_point was never modified by DoHook (M6b uses PTE.UXN=1
+     * instead), so after uninstall the OAT page becomes executable again and the
+     * original entry_point in target is still valid — target resumes normal execution
+     * after CopyFrom restores the full ArtMethod body. */
+    {
+        int32_t  m6_slot = -1;
+        uint64_t orig_va  = 0;
+        m6_hook_slots_().if_contains(target, [&m6_slot, &orig_va](const auto &it) {
+            m6_slot = it.second.slot_idx;
+            orig_va = it.second.original_oat_va;
+        });
+        if (m6_slot >= 0) {
+            int rc = shadowhook_m6_uninstall_for_lsplant(m6_slot);
+            if (rc != 0) {
+                LOGE("M6b DoUnHook: shadowhook_m6_uninstall_for_lsplant(slot=%d) failed rc=%d;"
+                     " PTE.UXN may still be armed — target will SIGSEGV on OAT fetch.",
+                     m6_slot, rc);
+                /* Fallthrough: restore backup entry_point and erase slot record anyway.
+                 * Leaving the record would block a future re-hook on the same method. */
+            }
+            /* Restore backup's entry_point to original OAT VA so that the CopyFrom below
+             * propagates original_oat_va into target (not the interpreter entry_point that
+             * SetEntryPointsToInterpreter wrote during DoHook). */
+            backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
+            m6_hook_slots_().erase(target);
+        } else {
+            LOGE("M6b DoUnHook: no M6 slot record for target %p — cannot uninstall hook",
+                 target);
+        }
+    }
+#elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
     /* [M4b.3 R1+R2 P1 修] 拆 hook (PTE 主路径 / Dobby fallback) + 还原 target.entry_point。
      *
      * 顺序：
@@ -830,7 +922,18 @@ using ::lsplant::IsHooked;
         !info.art_symbol_prefix_resolver) {
         return false;
     }
-    bool static kInit = InitConfig(info) && InitJNI(env) && InitNative(env, info);
+    bool static kInit = InitConfig(info) && InitJNI(env)
+#ifndef LSPLANT_M6_BACKEND
+        /* InitNative installs ~35 Dobby inline hooks on libart functions
+         * (FixupStaticTrampolines, ClassLinker::InitializeClass, etc.).
+         * M6b skips it so libart .text stays physically unmodified — the
+         * entire point of the M6b backend.  ScopedSuspendAll::Init is also
+         * part of InitNative; since it is not called, ScopedSuspendAll
+         * objects cannot be constructed in DoHook/DoUnHook (gated by
+         * #ifndef LSPLANT_M6_BACKEND there). */
+        && InitNative(env, info)
+#endif  /* LSPLANT_M6_BACKEND */
+        ;
     return kInit;
 }
 

@@ -129,6 +129,26 @@ inline auto& pte_hook_slots_() {
     return instance;
 }
 
+#ifdef LSPLANT_M6_BACKEND
+/* Per-ArtMethod record of the M6 PTE/UXN slot and the original OAT entry VA.
+ * Used by DoUnHook to call shadowhook_m6_uninstall_for_lsplant + restore entry.
+ *
+ * slot_idx: KPM slot returned by SH_CMD_M6_SIMPLE_HOOK (≥0 valid)
+ * original_oat_va: ArtMethod entry_point BEFORE hook install, restored on unhook.
+ *
+ * Meyer's singleton pattern: same rationale as pte_hook_slots_() above — avoids
+ * init_array order fiasco when lsplant is dlopen-loaded from a ctor context. */
+struct M6HookRecord {
+    int32_t  slot_idx;        /* KPM slot returned by SH_CMD_M6_SIMPLE_HOOK */
+    uint64_t original_oat_va; /* ArtMethod entry_point BEFORE hook install */
+};
+
+inline auto& m6_hook_slots_() {
+    static SharedHashMap<art::ArtMethod *, M6HookRecord> instance;
+    return instance;
+}
+#endif  /* LSPLANT_M6_BACKEND */
+
 inline auto& hooked_classes_() {
     static SharedHashMap<const art::dex::ClassDef *, phmap::flat_hash_set<art::ArtMethod *>>
         instance;
