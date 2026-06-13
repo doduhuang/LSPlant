@@ -365,6 +365,43 @@ public:
         return true;
     }
 
+#ifdef LSPLANT_M6_BACKEND
+    /* Resolve only the interpreter bridge entry point for M6b mode.
+     * ClassLinker::Init also installs Dobby hooks on FixupStaticTrampolines*,
+     * Register/UnregisterNative*, AdjustThreadVisibilityCounter_, and
+     * MarkVisiblyInitialized_ — all of which would modify libart .text,
+     * defeating M6b's zero-modification goal.  This function replaces that
+     * full Init with a symbol-only pass that calls HookHandler exclusively on
+     * .as<> members, so info_.inline_hooker is never invoked. */
+    static bool InitM6b(JNIEnv *env, const HookHandler &handler) {
+        if (!handler(SetEntryPointsToInterpreter_)) [[likely]] {
+            if (handler(GetOptimizedCodeFor_, GetOptimizedCodeForL_, true)) [[likely]] {
+                auto obj = JNI_FindClass(env, "java/lang/Object");
+                if (!obj) {
+                    LOGE("M6b ClassLinker: cannot find java/lang/Object");
+                    return false;
+                }
+                auto method = JNI_GetMethodID(env, obj, "equals", "(Ljava/lang/Object;)Z");
+                if (!method) {
+                    LOGE("M6b ClassLinker: cannot find Object.equals");
+                    return false;
+                }
+                auto dummy = ArtMethod::FromReflectedMethod(
+                        env, JNI_ToReflectedMethod(env, obj, method, false).get())->Clone();
+                JavaDebuggableGuard guard;
+                dummy->SetNonNative();
+                art_quick_to_interpreter_bridge_ = GetOptimizedCodeFor(dummy.get());
+            } else if (!handler(art_quick_to_interpreter_bridge_)) [[unlikely]] {
+                LOGE("M6b ClassLinker: cannot resolve interpreter bridge");
+                return false;
+            }
+            LOGD("M6b ClassLinker: art_quick_to_interpreter_bridge = %p",
+                 &art_quick_to_interpreter_bridge_);
+        }
+        return true;
+    }
+#endif  /* LSPLANT_M6_BACKEND */
+
     [[gnu::always_inline]] static bool SetEntryPointsToInterpreter(ArtMethod *art_method) {
         if (art_method->IsNative()) {
             return false;

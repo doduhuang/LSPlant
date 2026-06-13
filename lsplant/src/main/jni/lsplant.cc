@@ -322,6 +322,41 @@ inline void UpdateTrampoline(uint8_t offset) {
         offset >> (CHAR_BIT - entry_point_offset % CHAR_BIT);
 }
 
+#ifdef LSPLANT_M6_BACKEND
+/* Stripped-down InitNative for M6b mode.
+ * InitNative also initializes ScopedSuspendAll, Thread, Runtime, ClassLinker
+ * (full), and JitCodeCache — all of which install Dobby inline hooks on
+ * libart symbols, modifying libart .text and defeating M6b's zero-modification
+ * goal.  M6b only needs ArtMethod field offsets (no hooks on API 33), the
+ * Runtime::instance_ pointer (for JavaDebuggableGuard in ClassLinker::InitM6b),
+ * and the interpreter bridge symbol.
+ *
+ * Call order: ArtMethod::Init → UpdateTrampoline → Runtime::Init →
+ *             ClassLinker::InitM6b.
+ * Runtime::Init uses only .as<> symbol lookups (no Dobby hooks).
+ * The UpdateTrampoline call bakes the ArtMethod entry_point offset into the
+ * trampoline byte array so that GenerateTrampolineFor produces correct patches
+ * for the hook ArtMethod's entry_point field. */
+bool InitNativeM6b(JNIEnv *env, const HookHandler &handler) {
+    if (!ArtMethod::Init(env, handler)) {
+        LOGE("M6b: Failed to init ArtMethod");
+        return false;
+    }
+    UpdateTrampoline(ArtMethod::GetEntryPointOffset());
+    /* Runtime::Init resolves instance_ and SetJavaDebuggable_ via .as<> only.
+     * ClassLinker::InitM6b's JavaDebuggableGuard requires instance_ to be set. */
+    if (!Runtime::Init(handler)) {
+        LOGE("M6b: Failed to init Runtime");
+        return false;
+    }
+    if (!ClassLinker::InitM6b(env, handler)) {
+        LOGE("M6b: Failed to init ClassLinker interpreter bridge");
+        return false;
+    }
+    return true;
+}
+#endif  /* LSPLANT_M6_BACKEND */
+
 bool InitNative(JNIEnv *env, const HookHandler &handler) {
     // ① Resolve ScopedSuspendAll ctor/dtor symbols FIRST (chicken-and-egg):
     // ScopedSuspendAll::Init() only installs 2 inline hooks on ART internals
@@ -942,6 +977,12 @@ using ::lsplant::IsHooked;
          * objects cannot be constructed in DoHook/DoUnHook (gated by
          * #ifndef LSPLANT_M6_BACKEND there). */
         && InitNative(env, info)
+#else
+        /* M6b: call only the Dobby-free subset needed for DoHook.
+         * ArtMethod::Init sets art_method_field + access_flags_offset (no
+         * Dobby hooks on API 33).  ClassLinker::InitM6b resolves only the
+         * interpreter bridge entry point (no hooks, .as<> lookups only). */
+        && InitNativeM6b(env, info)
 #endif  /* LSPLANT_M6_BACKEND */
         ;
     return kInit;
@@ -1034,6 +1075,14 @@ using ::lsplant::IsHooked;
             },
             kInternalMethods);
         jobject global_backup = JNI_NewGlobalRef(env, reflected_backup);
+#ifdef LSPLANT_M6_BACKEND
+        /* M6b: Class::Init is not called (avoids Dobby hooks on libart), so
+         * GetClassDef_ is unresolved (null).  hooked_classes_ / deoptimized_classes_ /
+         * deoptimized_methods_set_ are never consulted in M6b (no SetStatus_ /
+         * FixupStaticTrampolines handlers).  Pass nullptr as class_def; hooked_methods_
+         * is still populated so UnHook can find and remove the entry. */
+        RecordHooked(target, nullptr, global_backup, backup, backup_jmethodid);
+#else
         RecordHooked(target, target->GetDeclaringClass()->GetClassDef(), global_backup, backup,
                      backup_jmethodid);
         if (!is_proxy) [[likely]] {
@@ -1045,6 +1094,7 @@ using ::lsplant::IsHooked;
         // by FixupStaticTrampolines on hooker class
         // Used hook's declaring class here since backup's is no longer the same with hook's
         RecordDeoptimized(hook->GetDeclaringClass()->GetClassDef(), backup);
+#endif  /* LSPLANT_M6_BACKEND */
         return global_backup;
     }
 
@@ -1071,10 +1121,12 @@ using ::lsplant::IsHooked;
     // FIXME: not atomic, but should be fine
     hooked_methods_().erase(backup);
     backuped_proxy_methods_().erase(backup);
+#ifndef LSPLANT_M6_BACKEND
     hooked_classes_().erase_if(target->GetDeclaringClass()->GetClassDef(), [&target](auto &it) {
         it.second.erase(target);
         return it.second.empty();
     });
+#endif  /* LSPLANT_M6_BACKEND */
     // shadowhook 修（V2）: Android 13+ opaque jni ids 下的 UnHook SIGSEGV 根因与修复。
     //
     // 【根因】env->FromReflectedMethod(reflected_backup) 在 DoHook 之后调用会崩：
@@ -1132,7 +1184,9 @@ using ::lsplant::IsHooked;
     }
     auto *art_method = ArtMethod::FromReflectedMethod(env, method);
     // record the original but not the backup
+#ifndef LSPLANT_M6_BACKEND
     RecordDeoptimized(art_method->GetDeclaringClass()->GetClassDef(), art_method);
+#endif  /* LSPLANT_M6_BACKEND */
     if (auto *backup = IsHooked(art_method); backup) {
         art_method = backup;
     }
