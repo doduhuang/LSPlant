@@ -647,7 +647,10 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          *   4. 记录 (target → {slot_idx, original_oat_va}) 供 DoUnHook 还原。
          * ============================================================ */
 
-        /* Step 1: 捕获原始 OAT entry_point（BackupTo 之前，字段还未被覆写） */
+        /* Step 1: 捕获原始 OAT entry_point。
+         * BackupTo() 已在上方执行，但它只改写 backup 的字段（CopyFrom）和 target 的
+         * access_flags（SetNonCompilable / ClearFastInterpretFlag），不触碰 target 的
+         * entry_point 字段，所以此处读到的仍是原始 OAT VA。 */
         uint64_t target_oat_va = reinterpret_cast<uint64_t>(target->GetEntryPoint());
 
         /* Step 2: 安装 M6 PTE/UXN hook */
@@ -664,7 +667,11 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         /* Step 3: backup entry_point → ART interpreter
          * call_original (cb.backup.invoke) 走 interpreter DEX 路径，不触发 UXN trap。
          * ClassLinker::SetEntryPointsToInterpreter 由 import :class_linker 提供。 */
-        ClassLinker::SetEntryPointsToInterpreter(backup);
+        if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
+            LOGE("M6b DoHook: SetEntryPointsToInterpreter failed — rolling back PTE install");
+            shadowhook_m6_uninstall_for_lsplant(m6_slot);
+            return false;
+        }
 
         /* Step 4: 记录 slot + original VA 供 DoUnHook */
         m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va}});
@@ -766,8 +773,11 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
             backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
             m6_hook_slots_().erase(target);
         } else {
-            LOGE("M6b DoUnHook: no M6 slot record for target %p — cannot uninstall hook",
-                 target);
+            LOGE("M6b DoUnHook: no M6 slot record for target — restoring entry_point from target");
+            /* backup was set to interpreter by DoHook; target->entry_point was never
+             * changed (M6b uses PTE.UXN=1 instead). Propagate target's original OAT VA
+             * into backup so CopyFrom(backup) below restores it correctly. */
+            backup->SetEntryPoint(target->GetEntryPoint());
         }
     }
 #elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
