@@ -139,7 +139,7 @@ inline auto& pte_hook_slots_() {
  * Meyer's singleton pattern: same rationale as pte_hook_slots_() above — avoids
  * init_array order fiasco when lsplant is dlopen-loaded from a ctor context. */
 struct M6HookRecord {
-    int32_t  slot_idx;        /* KPM slot returned by SH_CMD_M6_SIMPLE_HOOK */
+    int32_t  slot_idx;        /* bridge slot idx returned by shadowhook_m6_install_for_lsplant */
     uint64_t original_oat_va; /* ArtMethod entry_point BEFORE hook install */
 };
 

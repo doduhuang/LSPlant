@@ -63,15 +63,22 @@ extern "C" long shadowhook_pte_uninstall_for_lsplant(int slot_idx, void *target_
 extern "C" void shadowhook_pte_force_recycle_slot_for_lsplant(int slot_idx);
 
 #ifdef LSPLANT_M6_BACKEND
-/* M6b: DoHook installs an M6 PTE/UXN slot; DoUnHook uninstalls it.
- * Implemented in bridge/lsplant_glue.cpp (C linkage wrappers over sh_m6_*).
- * install: target_oat_va = ArtMethod entry_point VA; trampoline_va = shellcode VA;
- *          *slot_out ≥0 = success.  Returns 0 on success.
- * uninstall: slot_idx ≥0.  Returns 0 on success. */
+/* M6b: PTE/UXN hook wrappers in bridge/lsplant_glue.cpp.
+ * install:        target_oat_va=OAT VA; trampoline_va=lsplant ghost ep;
+ *                 *slot_out=bridge slot idx (≥0=success). Returns 0 on success.
+ * smart_uninstall: bridge_slot_idx≥0; backup_ep=ART interp bridge VA.
+ *                  Returns 0=full, 1=partial, <0=error.
+ * rehook_redirect: bridge_slot_idx≥0; new_redirect_va=new trampoline ep.
+ *                  Returns 0=success, <0=error.
+ * uninstall (compat shim): delegates to smart_uninstall(backup_ep=orig_va). */
 extern "C" int shadowhook_m6_install_for_lsplant(void *target_oat_va,
                                                    void *trampoline_va,
                                                    int32_t *slot_out);
-extern "C" int shadowhook_m6_uninstall_for_lsplant(int32_t slot_idx);
+extern "C" int shadowhook_m6_smart_uninstall_for_lsplant(int32_t bridge_slot_idx,
+                                                           uint64_t backup_ep);
+extern "C" int shadowhook_m6_rehook_redirect_for_lsplant(int32_t bridge_slot_idx,
+                                                          uint64_t new_redirect_va);
+extern "C" int shadowhook_m6_uninstall_for_lsplant(int32_t slot_idx);  /* compat */
 #endif  /* LSPLANT_M6_BACKEND */
 
 module lsplant;
@@ -682,6 +689,37 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          *   4. 记录 (target → {slot_idx, original_oat_va}) 供 DoUnHook 还原。
          * ============================================================ */
 
+        /* Step 0: is_rehook 检测——Phase C 场景下，target 曾被 partial UnHook，
+         * m6_hook_slots_ 仍保有 bridge_slot_idx 记录；直接更新 redirect_va 即可，
+         * 无需重新 install（KPM slot 和 UXN 仍在位）。 */
+        {
+            int32_t existing_bridge_slot = -1;
+            m6_hook_slots_().if_contains(target, [&existing_bridge_slot](const auto &it) {
+                existing_bridge_slot = it.second.slot_idx;
+            });
+            if (existing_bridge_slot >= 0) {
+                int rc = shadowhook_m6_rehook_redirect_for_lsplant(
+                             existing_bridge_slot,
+                             reinterpret_cast<uint64_t>(entrypoint));
+                if (rc != 0) {
+                    LOGE("M6b DoHook rehook: rehook_redirect_for_lsplant"
+                         "(bridge=%d ep=%p) failed rc=%d",
+                         existing_bridge_slot, entrypoint, rc);
+                    return false;
+                }
+                /* backup 的 entry_point 在 DoHook 原 install 时已被
+                 * SetEntryPointsToInterpreter 改成 interp bridge；DoUnHook partial
+                 * 路径不清 entry_point，这里重新确保为 interp（防 ART 在 DoUnHook
+                 * CopyFrom 后改回 OAT VA）。 */
+                if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
+                    LOGE("M6b DoHook rehook: SetEntryPointsToInterpreter(backup) failed");
+                    return false;
+                }
+                /* m6_hook_slots_ 记录不变（bridge_slot + original_oat_va 均正确）。*/
+                return true;
+            }
+        }
+
         /* Step 1: 捕获原始 OAT entry_point。
          * BackupTo() 已在上方执行，但它只改写 backup 的字段（CopyFrom）和 target 的
          * access_flags（SetNonCompilable / ClearFastInterpretFlag），不触碰 target 的
@@ -703,8 +741,9 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          * call_original (cb.backup.invoke) 走 interpreter DEX 路径，不触发 UXN trap。
          * ClassLinker::SetEntryPointsToInterpreter 由 import :class_linker 提供。 */
         if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
-            LOGE("M6b DoHook: SetEntryPointsToInterpreter failed — rolling back PTE install");
-            shadowhook_m6_uninstall_for_lsplant(m6_slot);
+            LOGE("M6b DoHook: SetEntryPointsToInterpreter(backup) failed — rollback");
+            shadowhook_m6_smart_uninstall_for_lsplant(m6_slot,
+                reinterpret_cast<uint64_t>(backup->GetEntryPoint()));
             return false;
         }
 
@@ -779,39 +818,54 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
 #endif  /* LSPLANT_M6_BACKEND */
     LOGV("Unhooking: target = %p, backup = %p", target, backup);
 #ifdef LSPLANT_M6_BACKEND
-    /* M6b DoUnHook: uninstall KPM slot + restore backup entry_point → original OAT VA
+    /* M6b DoUnHook: smart_uninstall KPM slot + restore backup entry_point → original OAT VA
      * (so the subsequent CopyFrom propagates the correct VA back to target).
      *
+     * smart_uninstall 返回值语义：
+     *   0 = full：UXN cleared + KPM slot freed + bridge slot freed；erase m6_hook_slots_ 记录。
+     *   1 = partial：同一 OAT 页上仍有其他方法处于 hook 状态，UXN 保留；
+     *       KPM fault handler 已把 redirect_va 改为 backup_ep（ART interp bridge），
+     *       使 target 执行效果为「已卸钩」但 m6_hook_slots_ 记录保留（Phase C rehook 依赖）。
+     *  <0 = error：fallthrough restore + erase 让下次 re-hook 有机会。
+     *
      * Note: target's entry_point was never modified by DoHook (M6b uses PTE.UXN=1
-     * instead), so after uninstall the OAT page becomes executable again and the
+     * instead), so after full uninstall the OAT page becomes executable again and the
      * original entry_point in target is still valid — target resumes normal execution
      * after CopyFrom restores the full ArtMethod body. */
     {
-        int32_t  m6_slot = -1;
-        uint64_t orig_va  = 0;
-        m6_hook_slots_().if_contains(target, [&m6_slot, &orig_va](const auto &it) {
-            m6_slot = it.second.slot_idx;
-            orig_va = it.second.original_oat_va;
+        int32_t  bridge_slot = -1;
+        uint64_t orig_va     = 0;
+        m6_hook_slots_().if_contains(target, [&bridge_slot, &orig_va](const auto &it) {
+            bridge_slot = it.second.slot_idx;
+            orig_va     = it.second.original_oat_va;
         });
-        if (m6_slot >= 0) {
-            int rc = shadowhook_m6_uninstall_for_lsplant(m6_slot);
-            if (rc != 0) {
-                LOGE("M6b DoUnHook: shadowhook_m6_uninstall_for_lsplant(slot=%d) failed rc=%d;"
-                     " PTE.UXN may still be armed — target will SIGSEGV on OAT fetch.",
-                     m6_slot, rc);
-                /* Fallthrough: restore backup entry_point and erase slot record anyway.
-                 * Leaving the record would block a future re-hook on the same method. */
+        if (bridge_slot >= 0) {
+            /* backup->GetEntryPoint() = ART interpreter bridge VA（DoHook 时
+             * SetEntryPointsToInterpreter(backup) 所写），作为 partial path 的
+             * redirect_va（fault handler 在 partial 状态把 regs->pc 改为此值）。 */
+            uint64_t backup_ep = reinterpret_cast<uint64_t>(backup->GetEntryPoint());
+            int rc = shadowhook_m6_smart_uninstall_for_lsplant(bridge_slot, backup_ep);
+            if (rc == 0) {
+                /* Full uninstall: UXN cleared, KPM slot freed, bridge slot cleared.
+                 * 把 backup entry_point 恢复到原 OAT VA，CopyFrom 会把它传回 target。*/
+                backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
+                m6_hook_slots_().erase(target);
+            } else if (rc == 1) {
+                /* Partial uninstall: 同一 OAT 页上还有其他方法 hook 在位。
+                 * KPM slot redirect_va 已改为 backup_ep（interp bridge）；
+                 * target 的执行效果为「已卸钩」（UXN trap 重定向到 interp）。
+                 * m6_hook_slots_ 记录保留，Phase C 的 is_rehook 检测依赖它。*/
+                /* DO NOT erase m6_hook_slots_() — Phase C rehook needs bridge_slot */
+            } else {
+                LOGE("M6b DoUnHook: smart_uninstall(bridge=%d) failed rc=%d;"
+                     " PTE.UXN may still be armed — target SIGSEGV risk.",
+                     bridge_slot, rc);
+                /* Fallthrough: restore and erase to allow future re-hook attempt. */
+                backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
+                m6_hook_slots_().erase(target);
             }
-            /* Restore backup's entry_point to original OAT VA so that the CopyFrom below
-             * propagates original_oat_va into target (not the interpreter entry_point that
-             * SetEntryPointsToInterpreter wrote during DoHook). */
-            backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
-            m6_hook_slots_().erase(target);
         } else {
-            LOGE("M6b DoUnHook: no M6 slot record for target — restoring entry_point from target");
-            /* backup was set to interpreter by DoHook; target->entry_point was never
-             * changed (M6b uses PTE.UXN=1 instead). Propagate target's original OAT VA
-             * into backup so CopyFrom(backup) below restores it correctly. */
+            LOGE("M6b DoUnHook: no M6 slot record for target — restoring from target");
             backup->SetEntryPoint(target->GetEntryPoint());
         }
     }
