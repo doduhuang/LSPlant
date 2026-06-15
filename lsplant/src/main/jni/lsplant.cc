@@ -856,6 +856,12 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
                  * target 的执行效果为「已卸钩」（UXN trap 重定向到 interp）。
                  * m6_hook_slots_ 记录保留，Phase C 的 is_rehook 检测依赖它。*/
                 /* DO NOT erase m6_hook_slots_() — Phase C rehook needs bridge_slot */
+                /* spec §6.2: 设 backup entry_point = target OAT VA，使上层
+                 * CopyFrom(backup → target) 是 no-op，target.entry_point 保持
+                 * OAT VA 不变（M6b 靠 OAT page UXN trap 拦截，不读 entry_point
+                 * 字段，但 ART fast dispatch 读它——partial unhook 后 target 仍
+                 * 期望走 OAT VA 触发 fault handler，不能变成 interp bridge VA）。*/
+                backup->SetEntryPoint(target->GetEntryPoint());
             } else {
                 LOGE("M6b DoUnHook: smart_uninstall(bridge=%d) failed rc=%d;"
                      " PTE.UXN may still be armed — target SIGSEGV risk.",
