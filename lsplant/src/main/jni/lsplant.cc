@@ -83,6 +83,12 @@ extern "C" int shadowhook_m6_rehook_redirect_for_lsplant(int32_t bridge_slot_idx
                                                           uint64_t new_redirect_va);
 extern "C" int shadowhook_m6_uninstall_for_lsplant(int32_t slot_idx);  /* compat */
 
+/* M6b /apex/ 系统类 entry_point fallback 的命名 shim 分配器（bridge/lsplant_glue.cpp）。
+ * make: 返回 [anon:dalvik-jit-code-cache] 命名 shim VA（BR 跳 real_trampoline），失败 nullptr。
+ * free: munmap shim 页。 */
+extern "C" void *shadowhook_m6_make_named_shim(void *real_trampoline);
+extern "C" void  shadowhook_m6_free_named_shim(void *shim_va);
+
 /* OAT 页邻居 pass-through：SetEntryPointsToInterpreter(backup) 成功后捕获的
  * art_quick_to_interpreter_bridge VA。bridge 层传给 KPM fault handler，用于
  * M6b 页命中但无 slot 匹配时重定向到解释器（修 OAT 页污染问题）。 */
@@ -743,10 +749,33 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         int m6_rc = shadowhook_m6_register_slot_for_lsplant(
             reinterpret_cast<void *>(target_oat_va), entrypoint, &m6_slot);
         if (m6_rc != 0 || m6_slot < 0) {
-            LOGE("M6b DoHook: shadowhook_m6_register_slot_for_lsplant(.oat=%p, trampoline=%p)"
-                 " failed rc=%d slot=%d",
-                 (void *)target_oat_va, entrypoint, m6_rc, m6_slot);
-            return false;
+            /* ── /apex/ 系统类 entry_point fallback ──────────────────────────────
+             * register_slot 拒绝（-EINVAL）：target OAT VA 在 boot image（/apex/，
+             * 跨进程共享，不能 PTE/UXN）。回退到上游 LSPlant 原版机制——改
+             * ArtMethod.entry_point。但不直指隐藏 ghost trampoline（会让检测器读到
+             * entry_point 指向未映射内存 → -1 异常），而是经命名 shim 页 BR 跳转。
+             * libart .text 零篡改保持（entry_point 在 LinearAlloc，不在 .text）。 */
+            void *shim = shadowhook_m6_make_named_shim(entrypoint);
+            if (!shim) {
+                LOGE("M6b DoHook fallback: make_named_shim failed (target stays unhooked)");
+                return false;
+            }
+            target->SetEntryPoint(shim);
+            /* backup entry_point → ART interpreter，使 cb.backup.invoke() 走 DEX 解释，
+             * 不重入 shim/trampoline（call-original 正确性）。 */
+            if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
+                LOGE("M6b DoHook fallback: SetEntryPointsToInterpreter(backup) failed — rollback");
+                target->SetEntryPoint(reinterpret_cast<void *>(target_oat_va));
+                shadowhook_m6_free_named_shim(shim);
+                return false;
+            }
+            if (!g_lsplant_interp_bridge_va) {
+                g_lsplant_interp_bridge_va = backup->GetEntryPoint();
+            }
+            /* 记录 fallback：slot_idx=-1，shim_va 供 DoUnHook munmap。 */
+            m6_hook_slots_().insert({target, M6HookRecord{
+                -1, target_oat_va, true, reinterpret_cast<uint64_t>(shim)}});
+            return true;
         }
 
         /* Step 3: backup entry_point → ART interpreter
@@ -850,11 +879,23 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
     {
         int32_t  bridge_slot = -1;
         uint64_t orig_va     = 0;
-        m6_hook_slots_().if_contains(target, [&bridge_slot, &orig_va](const auto &it) {
-            bridge_slot = it.second.slot_idx;
-            orig_va     = it.second.original_oat_va;
-        });
-        if (bridge_slot >= 0) {
+        bool     is_fallback = false;
+        uint64_t shim_va     = 0;
+        m6_hook_slots_().if_contains(target,
+            [&bridge_slot, &orig_va, &is_fallback, &shim_va](const auto &it) {
+                bridge_slot = it.second.slot_idx;
+                orig_va     = it.second.original_oat_va;
+                is_fallback = it.second.is_entry_point_fallback;
+                shim_va     = it.second.shim_va;
+            });
+        if (is_fallback) {
+            /* entry_point fallback 卸钩：无 KPM/UXN，无 partial 状态。把 backup
+             * entry_point 还原为原 OAT VA（下方 CopyFrom 把它传回 target.entry_point
+             * = boot OAT VA，再次可执行），munmap shim 页，erase 记录。 */
+            backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
+            shadowhook_m6_free_named_shim(reinterpret_cast<void *>(shim_va));
+            m6_hook_slots_().erase(target);
+        } else if (bridge_slot >= 0) {
             /* backup->GetEntryPoint() = ART interpreter bridge VA（DoHook 时
              * SetEntryPointsToInterpreter(backup) 所写），作为 partial path 的
              * redirect_va（fault handler 在 partial 状态把 regs->pc 改为此值）。 */
