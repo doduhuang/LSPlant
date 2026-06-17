@@ -733,8 +733,6 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          * access_flags（SetNonCompilable / ClearFastInterpretFlag），不触碰 target 的
          * entry_point 字段，所以此处读到的仍是原始 OAT VA。 */
         uint64_t target_oat_va = reinterpret_cast<uint64_t>(target->GetEntryPoint());
-        __android_log_print(ANDROID_LOG_DEBUG, "SH33D",
-            "cp=oat target_oat_va=0x%llx", (unsigned long long)target_oat_va);
 
         /* Step 2: 注册 M6 slot（延迟武装——UXN 由 nativeEndHookBatch 批量 arm）。
          * 延迟武装原因：Hooker.java 的 OAT continuation code（nativeInitAndHook JNI return 之后）
@@ -754,25 +752,18 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         /* Step 3: backup entry_point → ART interpreter
          * call_original (cb.backup.invoke) 走 interpreter DEX 路径，不触发 UXN trap。
          * ClassLinker::SetEntryPointsToInterpreter 由 import :class_linker 提供。 */
-        __android_log_print(ANDROID_LOG_DEBUG, "SH33D",
-            "cp=I before_SetEntryPointsToInterpreter isNative=%d",
-            (int)backup->IsNative());
         if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
             LOGE("M6b DoHook: SetEntryPointsToInterpreter(backup) failed — rollback");
             shadowhook_m6_smart_uninstall_for_lsplant(m6_slot,
                 reinterpret_cast<uint64_t>(backup->GetEntryPoint()));
             return false;
         }
-        __android_log_print(ANDROID_LOG_DEBUG, "SH33D", "cp=J after_SetEntryPointsToInterpreter");
-
         if (!g_lsplant_interp_bridge_va) {
             g_lsplant_interp_bridge_va = backup->GetEntryPoint();
         }
 
         /* Step 4: 记录 slot + original VA 供 DoUnHook */
-        __android_log_print(ANDROID_LOG_DEBUG, "SH33D", "cp=K before_insert");
         m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va}});
-        __android_log_print(ANDROID_LOG_DEBUG, "SH33D", "cp=L after_insert");
 
 #elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
         /* ============================================================
@@ -825,7 +816,6 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         target->SetEntryPoint(entrypoint);   /* M4a 原路径：改 entry_point 到 trampoline */
 #endif
 
-        __android_log_print(ANDROID_LOG_DEBUG, "SH33D", "cp=M before_return_true");
         LOGV("Done hook: target(%p:0x%x) -> %p; backup(%p:0x%x) -> %p; hook(%p:0x%x) -> %p", target,
              target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
              backup->GetEntryPoint(), hook, hook->GetAccessFlags(), hook->GetEntryPoint());
