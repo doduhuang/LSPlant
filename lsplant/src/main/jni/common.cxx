@@ -139,8 +139,10 @@ inline auto& pte_hook_slots_() {
  * Meyer's singleton pattern: same rationale as pte_hook_slots_() above — avoids
  * init_array order fiasco when lsplant is dlopen-loaded from a ctor context. */
 struct M6HookRecord {
-    int32_t  slot_idx;        /* bridge slot idx returned by shadowhook_m6_install_for_lsplant */
-    uint64_t original_oat_va; /* ArtMethod entry_point BEFORE hook install */
+    int32_t  slot_idx;                /* PTE/UXN: bridge slot idx (≥0); entry_point fallback: -1 */
+    uint64_t original_oat_va;         /* ArtMethod entry_point BEFORE hook install，unhook 时还原 */
+    bool     is_entry_point_fallback; /* true = /apex/ 系统类走 SetEntryPoint+shim; false = PTE/UXN */
+    uint64_t shim_va;                 /* fallback 专用：命名 shim 页 VA（PTE/UXN 时 0），unhook 时 munmap */
 };
 
 inline auto& m6_hook_slots_() {

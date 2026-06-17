@@ -763,7 +763,7 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         }
 
         /* Step 4: 记录 slot + original VA 供 DoUnHook */
-        m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va}});
+        m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va, false, 0}});
 
 #elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
         /* ============================================================
