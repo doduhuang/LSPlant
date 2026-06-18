@@ -730,8 +730,10 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                 /* backup 的 entry_point 在 DoHook 原 install 时已被
                  * SetEntryPointsToInterpreter 改成 interp bridge；DoUnHook partial
                  * 路径不清 entry_point，这里重新确保为 interp（防 ART 在 DoUnHook
-                 * CopyFrom 后改回 OAT VA）。 */
-                if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
+                 * CopyFrom 后改回 OAT VA）。
+                 * native 方法跳过——backup 走 JNI bridge，不经 OAT/UXN 页，无需改 interp。 */
+                if (!backup->IsNative() &&
+                    !ClassLinker::SetEntryPointsToInterpreter(backup)) {
                     LOGE("M6b DoHook rehook: SetEntryPointsToInterpreter(backup) failed");
                     return false;
                 }
@@ -768,8 +770,10 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
             }
             target->SetEntryPoint(shim);
             /* backup entry_point → ART interpreter，使 cb.backup.invoke() 走 DEX 解释，
-             * 不重入 shim/trampoline（call-original 正确性）。 */
-            if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
+             * 不重入 shim/trampoline（call-original 正确性）。
+             * native 方法跳过——backup 走 JNI bridge，不经 OAT/UXN 页，无需改 interp。 */
+            if (!backup->IsNative() &&
+                !ClassLinker::SetEntryPointsToInterpreter(backup)) {
                 LOGE("M6b DoHook fallback: SetEntryPointsToInterpreter(backup) failed — rollback");
                 target->SetEntryPoint(reinterpret_cast<void *>(target_oat_va));
                 shadowhook_m6_free_named_shim(shim);
@@ -791,8 +795,10 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
 
         /* Step 3: backup entry_point → ART interpreter
          * call_original (cb.backup.invoke) 走 interpreter DEX 路径，不触发 UXN trap。
-         * ClassLinker::SetEntryPointsToInterpreter 由 import :class_linker 提供。 */
-        if (!ClassLinker::SetEntryPointsToInterpreter(backup)) {
+         * ClassLinker::SetEntryPointsToInterpreter 由 import :class_linker 提供。
+         * native 方法跳过——backup 走 JNI bridge，不经 OAT/UXN 页，无需改 interp。 */
+        if (!backup->IsNative() &&
+            !ClassLinker::SetEntryPointsToInterpreter(backup)) {
             LOGE("M6b DoHook: SetEntryPointsToInterpreter(backup) failed — rollback");
             shadowhook_m6_smart_uninstall_for_lsplant(m6_slot,
                 reinterpret_cast<uint64_t>(backup->GetEntryPoint()));
