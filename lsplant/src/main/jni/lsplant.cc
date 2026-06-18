@@ -89,6 +89,12 @@ extern "C" int shadowhook_m6_uninstall_for_lsplant(int32_t slot_idx);  /* compat
 extern "C" void *shadowhook_m6_make_named_shim(void *real_trampoline);
 extern "C" void  shadowhook_m6_free_named_shim(void *shim_va);
 
+/* EP Spoof: 注册/注销 entry_point 字段地址 → 原始 OAT VA 映射（bridge + KPM 双侧）。
+ * 在 DoHook fallback 路径（shim 替换 entry_point）后调 register，
+ * 在 DoUnHook fallback 路径（还原 entry_point）前调 unregister。 */
+extern "C" void shadowhook_ep_spoof_register(uintptr_t ep_field_addr, uint64_t original_ep);
+extern "C" void shadowhook_ep_spoof_unregister(uintptr_t ep_field_addr);
+
 /* OAT 页邻居 pass-through：SetEntryPointsToInterpreter(backup) 成功后捕获的
  * art_quick_to_interpreter_bridge VA。bridge 层传给 KPM fault handler，用于
  * M6b 页命中但无 slot 匹配时重定向到解释器（修 OAT 页污染问题）。 */
@@ -775,6 +781,11 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
             /* 记录 fallback：slot_idx=-1，shim_va 供 DoUnHook munmap。 */
             m6_hook_slots_().insert({target, M6HookRecord{
                 -1, target_oat_va, true, reinterpret_cast<uint64_t>(shim)}});
+            /* EP Spoof 注册：让 bridge + KPM 侧的 spoof 表知道此 ArtMethod+24 对应的
+             * 原始 OAT VA，RASP pread64 hook 拦截读 entry_point 字段时返回原始值。 */
+            shadowhook_ep_spoof_register(
+                reinterpret_cast<uintptr_t>(target) + 24,
+                target_oat_va);
             return true;
         }
 
@@ -892,6 +903,10 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
             /* entry_point fallback 卸钩：无 KPM/UXN，无 partial 状态。把 backup
              * entry_point 还原为原 OAT VA（下方 CopyFrom 把它传回 target.entry_point
              * = boot OAT VA，再次可执行），munmap shim 页，erase 记录。 */
+            /* EP Spoof 注销：还原 entry_point 前先从 spoof 表移除，
+             * 还原后 RASP 再读字段会得到真实 OAT VA，无需再 spoof。 */
+            shadowhook_ep_spoof_unregister(
+                reinterpret_cast<uintptr_t>(target) + 24);
             backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
             shadowhook_m6_free_named_shim(reinterpret_cast<void *>(shim_va));
             m6_hook_slots_().erase(target);
