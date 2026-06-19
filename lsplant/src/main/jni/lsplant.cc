@@ -1376,8 +1376,8 @@ void UnHookAll(JNIEnv *env) {
     {
         auto &map = hooked_methods_();
         targets.reserve(map.size());
-        for (auto &[target, tup] : map) {
-            targets.push_back(target);
+        for (auto &[art_method, tup] : map) {
+            targets.push_back(std::get<0>(tup));
         }
     }
     for (auto t : targets) {
