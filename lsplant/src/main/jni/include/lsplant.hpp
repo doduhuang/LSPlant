@@ -139,6 +139,11 @@ struct InitInfo {
 [[nodiscard, maybe_unused, gnu::visibility("default")]] bool UnHook(JNIEnv *env,
                                                                     jobject target_method);
 
+/// \brief Unhook all currently hooked methods.
+/// Snapshots hooked_methods_() keys then calls UnHook per target.
+[[maybe_unused, gnu::visibility("default")]]
+void UnHookAll(JNIEnv *env);
+
 /// \brief Check if a Java function is hooked by LSPlant or not
 /// \param[in] env The Java environment.
 /// \param[in] method The method to check if it was hooked or not.

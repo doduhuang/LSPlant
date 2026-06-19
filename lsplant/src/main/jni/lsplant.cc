@@ -1370,6 +1370,20 @@ using ::lsplant::IsHooked;
     return DexFile::SetTrusted(env, cookie);
 }
 }
+
+void UnHookAll(JNIEnv *env) {
+    std::vector<jobject> targets;
+    {
+        auto &map = hooked_methods_();
+        targets.reserve(map.size());
+        for (auto &[target, tup] : map) {
+            targets.push_back(target);
+        }
+    }
+    for (auto t : targets) {
+        UnHook(env, t);
+    }
+}
 }  // namespace v2
 
 }  // namespace lsplant
