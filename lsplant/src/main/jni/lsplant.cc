@@ -1369,7 +1369,6 @@ using ::lsplant::IsHooked;
     if (!cookie) return false;
     return DexFile::SetTrusted(env, cookie);
 }
-}
 
 void UnHookAll(JNIEnv *env) {
     std::vector<jobject> targets;
@@ -1384,6 +1383,7 @@ void UnHookAll(JNIEnv *env) {
         UnHook(env, t);
     }
 }
+}  // extern "C++"
 }  // namespace v2
 
 }  // namespace lsplant
