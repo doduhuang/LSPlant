@@ -731,11 +731,18 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                  * SetEntryPointsToInterpreter 改成 interp bridge；DoUnHook partial
                  * 路径不清 entry_point，这里重新确保为 interp（防 ART 在 DoUnHook
                  * CopyFrom 后改回 OAT VA）。
-                 * native 方法跳过——backup 走 JNI bridge，不经 OAT/UXN 页，无需改 interp。 */
+                 * native 方法跳过——backup 走 JNI bridge，不经 OAT/UXN 页，无需改 interp。
+                 *
+                 * shadowhook audit LFD-2 fix: 此调用是 belt-and-suspenders (双保险)——
+                 * Phase B partial UnHook 已把 backup 设为 interp, rehook 时不改也不会破
+                 * hook 语义 (KPM slot 重定向 target 到 new trampoline; backup.invoke()
+                 * 走 interp 正确). SetEntryPointsToInterpreter fail 时**不 return false**
+                 * (否则 caller 认为 hook 失败但 KPM 已 armed, 状态不一致); 改 LOGW 保留
+                 * hook 装载, 仍 return true. */
                 if (!backup->IsNative() &&
                     !ClassLinker::SetEntryPointsToInterpreter(backup)) {
-                    LOGE("M6b DoHook rehook: SetEntryPointsToInterpreter(backup) failed");
-                    return false;
+                    LOGW("M6b DoHook rehook: SetEntryPointsToInterpreter(backup) failed "
+                         "— proceeding (backup already at interp from Phase B partial UnHook)");
                 }
                 /* m6_hook_slots_ 记录不变（bridge_slot + original_oat_va 均正确）。*/
                 return true;
@@ -768,20 +775,30 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                 LOGE("M6b DoHook fallback: make_named_shim failed (target stays unhooked)");
                 return false;
             }
-            target->SetEntryPoint(shim);
-            /* backup entry_point → ART interpreter，使 cb.backup.invoke() 走 DEX 解释，
-             * 不重入 shim/trampoline（call-original 正确性）。
-             * native 方法跳过——backup 走 JNI bridge，不经 OAT/UXN 页，无需改 interp。 */
+            /* shadowhook audit LFD-3 fix: 顺序重排避免 rollback race——
+             *   旧顺序: SetEntryPoint(shim) → SetEntryPointsToInterpreter(backup) → rollback
+             *   问题:   步骤 1 后步骤 2 前, 其他 in-flight 线程可能通过 target.M() 已 dispatch
+             *           到 shim → 跳 real_trampoline → callback 执行. 步骤 2 fail 后
+             *           rollback 步骤 munmap shim → 悬空指针; 若还有线程在 shim 内 crash.
+             *   新顺序: SetEntryPointsToInterpreter(backup) 先 → SetEntryPoint(shim) 最后
+             *           SetEntryPointsToInterpreter fail 时 shim 还没 install, munmap 安全
+             *           不会有线程执行 shim (target 仍在 boot OAT VA 上). 无需
+             *           ScopedSuspendAll — 靠单一 SetEntryPoint 原子 store 实现最后 commit.
+             *
+             * native 方法: backup 走 JNI bridge, 不经 OAT/UXN 页, 无需改 interp; 但仍需
+             * install shim 让 target 命中. 拆条件: interp fail 只在 !IsNative 才 fail-early. */
             if (!backup->IsNative() &&
                 !ClassLinker::SetEntryPointsToInterpreter(backup)) {
-                LOGE("M6b DoHook fallback: SetEntryPointsToInterpreter(backup) failed — rollback");
-                target->SetEntryPoint(reinterpret_cast<void *>(target_oat_va));
+                LOGE("M6b DoHook fallback: SetEntryPointsToInterpreter(backup) failed "
+                     "— aborting install (target stays unhooked, safe to munmap shim)");
                 shadowhook_m6_free_named_shim(shim);
                 return false;
             }
             if (!g_lsplant_interp_bridge_va) {
                 g_lsplant_interp_bridge_va = backup->GetEntryPoint();
             }
+            /* 最后一步 (原子 commit): 设 target.entry_point = shim, 从此 target.M() 走 hook. */
+            target->SetEntryPoint(shim);
             /* 记录 fallback：slot_idx=-1，shim_va 供 DoUnHook munmap。 */
             m6_hook_slots_().insert({target, M6HookRecord{
                 -1, target_oat_va, true, reinterpret_cast<uint64_t>(shim)}});
