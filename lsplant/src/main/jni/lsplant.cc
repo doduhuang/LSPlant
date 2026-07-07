@@ -763,10 +763,14 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         int32_t m6_slot = -1;
         int m6_rc = shadowhook_m6_register_slot_for_lsplant(
             reinterpret_cast<void *>(target_oat_va), entrypoint, &m6_slot);
-        if (m6_rc != 0 || m6_slot < 0) {
+        /* R2-CM-04 治本 (审计 Medium): 严格区分 SH_M6_E_INVAL (/apex/ VA 合法拒绝, 走
+         * shim fallback) 与 SH_M6_E_NOSPC / 其他 (slot 表满 or 通用错误, 直接 return
+         * false 不 fallback). 之前 `m6_rc != 0 || m6_slot < 0` 把两情况混, slot 满时
+         * 也走 fallback 泄漏 shim 页 + 破坏 M6b 主路径承诺. */
+        if (m6_rc == SH_M6_E_INVAL) {
             /* ── /apex/ 系统类 entry_point fallback ──────────────────────────────
-             * register_slot 拒绝（-EINVAL）：target OAT VA 在 boot image（/apex/，
-             * 跨进程共享，不能 PTE/UXN）。回退到上游 LSPlant 原版机制——改
+             * register_slot 明确以 SH_M6_E_INVAL 拒绝: target OAT VA 在 boot image
+             * (/apex/, 跨进程共享, 不能 PTE/UXN). 回退到上游 LSPlant 原版机制——改
              * ArtMethod.entry_point。但不直指隐藏 ghost trampoline（会让检测器读到
              * entry_point 指向未映射内存 → -1 异常），而是经命名 shim 页 BR 跳转。
              * libart .text 零篡改保持（entry_point 在 LinearAlloc，不在 .text）。 */
@@ -819,6 +823,13 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                 return false;
             }
             return true;
+        }
+        if (m6_rc != SH_M6_OK || m6_slot < 0) {
+            /* R2-CM-04: 非 -EINVAL 类错误 (slot 表满 SH_M6_E_NOSPC / kallsyms 未 resolve
+             * SH_M6_E_NOENT / 通用错误 SH_M6_E_GENERIC 等) 明确 return false 让 caller
+             * 感知 hook 失败, 不静默走 shim fallback 掩盖 slot 表满等结构性问题. */
+            LOGE("M6b DoHook: register_slot rc=%d (not -EINVAL, no fallback) - hook failed", m6_rc);
+            return false;
         }
 
         /* Step 3: backup entry_point → ART interpreter

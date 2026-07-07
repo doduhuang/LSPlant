@@ -31,4 +31,13 @@
 #define SHADOWHOOK_SLOT_INVALID         (-1)
 #define SHADOWHOOK_SLOT_FALLBACK_DOBBY  (-2)
 
+/* R2-CM-04: 与 <SH_ROOT>/include/shadowhook_lsplant_abi.h 保持同步. */
+#define SH_M6_OK                (0)
+#define SH_M6_E_INVAL           (-22)
+#define SH_M6_E_NOSPC           (-28)
+#define SH_M6_E_FAULT           (-14)
+#define SH_M6_E_NOENT           (-2)
+#define SH_M6_E_PMD             (-34)
+#define SH_M6_E_GENERIC         (-1)
+
 #endif /* SHADOWHOOK_LSPLANT_ABI_H */
