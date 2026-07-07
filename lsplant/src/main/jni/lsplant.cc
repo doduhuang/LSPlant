@@ -1371,16 +1371,29 @@ using ::lsplant::IsHooked;
 }
 
 void UnHookAll(JNIEnv *env) {
+    // shadowhook audit LFD-1 fix: 原实现用 range-for 直接迭代 phmap parallel_flat_hash_map
+    // 全表——parallel_flat_hash_map 的每个 submap 有独立 std::shared_mutex, range-for
+    // 不上任何锁, 与并发 Hook 触发 submap rehash 有 iterator invalidation SIGSEGV race
+    // (rehash 移动 slot → 下一次 iterator 步进读到已 dealloc 内存). Concurrent Hook 期间
+    // 触发 UnHookAll(比如 App exit + hot-reload) 会 crash 或漏 unhook (残留 trampoline
+    // 在 kpm unload 后被访问 → SIGSEGV).
+    //
+    // 修法: 用 phmap 官方扩展 API for_each(). 底层对每个 submap 各自 SharedLock 后
+    // std::for_each, 与 Hook 侧的 emplace/erase (UniqueLock) 语义正确同步——iterator
+    // 在 lock 内构造+使用+销毁, 出 lock 前不再访问, 消除 rehash race.
+    //
+    // Snapshot targets 到本地 vector 后释放所有 submap 锁再逐个 UnHook——UnHook 内部会
+    // 反过来对 hooked_methods_ 做 write lock, 若在 for_each 里直接调 UnHook 会 self-deadlock
+    // (SharedLock 持有中再申请 UniqueLock).
     std::vector<jobject> targets;
-    {
-        auto &map = hooked_methods_();
-        targets.reserve(map.size());
-        for (auto &[art_method, tup] : map) {
-            targets.push_back(std::get<0>(tup));
-        }
-    }
+    hooked_methods_().for_each([&targets](const auto &kv) {
+        targets.push_back(std::get<0>(kv.second));
+    });
     for (auto t : targets) {
-        UnHook(env, t);
+        // UnHook 是 [[nodiscard]] bool——UnHookAll 语义是 best-effort 卸载所有,
+        // 单条失败不影响后续 (log 已在 UnHook 内部); 显式 static_cast<void> 表达
+        // 有意丢弃返回值, 消除 nodiscard 编译警告.
+        static_cast<void>(UnHook(env, t));
     }
 }
 }  // extern "C++"
