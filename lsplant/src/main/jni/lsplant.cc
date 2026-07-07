@@ -799,14 +799,25 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
             }
             /* 最后一步 (原子 commit): 设 target.entry_point = shim, 从此 target.M() 走 hook. */
             target->SetEntryPoint(shim);
-            /* 记录 fallback：slot_idx=-1，shim_va 供 DoUnHook munmap。 */
-            m6_hook_slots_().insert({target, M6HookRecord{
-                -1, target_oat_va, true, reinterpret_cast<uint64_t>(shim)}});
-            /* EP Spoof 注册：让 bridge + KPM 侧的 spoof 表知道此 ArtMethod+24 对应的
-             * 原始 OAT VA，RASP pread64 hook 拦截读 entry_point 字段时返回原始值。 */
-            shadowhook_ep_spoof_register(
-                reinterpret_cast<uintptr_t>(target) + 24,
-                target_oat_va);
+            /* shadowhook audit LFD-1 (BLG-1) fix: phmap::insert 可能抛 bad_alloc (OOM);
+             * 若抛且不 catch, C++ noexcept-across-JNI 未定义行为 (通常 abort 进程) + shim
+             * 泄漏 + target entry_point 不回滚. try-catch 里出错 rollback:
+             * 恢复 target.entry_point 到原 OAT VA, munmap shim, 返 false. */
+            try {
+                /* 记录 fallback：slot_idx=-1，shim_va 供 DoUnHook munmap。 */
+                m6_hook_slots_().insert({target, M6HookRecord{
+                    -1, target_oat_va, true, reinterpret_cast<uint64_t>(shim)}});
+                /* EP Spoof 注册：让 bridge + KPM 侧的 spoof 表知道此 ArtMethod+24 对应的
+                 * 原始 OAT VA，RASP pread64 hook 拦截读 entry_point 字段时返回原始值。 */
+                shadowhook_ep_spoof_register(
+                    reinterpret_cast<uintptr_t>(target) + 24,
+                    target_oat_va);
+            } catch (const std::bad_alloc &) {
+                LOGE("M6b DoHook fallback: phmap insert bad_alloc — rollback shim + entry_point");
+                target->SetEntryPoint(reinterpret_cast<void *>(target_oat_va));
+                shadowhook_m6_free_named_shim(shim);
+                return false;
+            }
             return true;
         }
 
@@ -825,8 +836,20 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
             g_lsplant_interp_bridge_va = backup->GetEntryPoint();
         }
 
-        /* Step 4: 记录 slot + original VA 供 DoUnHook */
-        m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va, false, 0}});
+        /* Step 4: 记录 slot + original VA 供 DoUnHook
+         * shadowhook audit BLG-1 fix: phmap::insert bad_alloc rollback KPM slot + backup interp. */
+        try {
+            m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va, false, 0}});
+        } catch (const std::bad_alloc &) {
+            LOGE("M6b DoHook: phmap insert bad_alloc — rollback KPM slot");
+            shadowhook_m6_smart_uninstall_for_lsplant(m6_slot,
+                reinterpret_cast<uint64_t>(backup->GetEntryPoint()));
+            /* backup->entry_point 仍是 interp bridge (SetEntryPointsToInterpreter 结果),
+             * caller 的 CopyFrom 会把它拷回 target—— target.entry_point 从 boot OAT VA
+             * 变成 interp bridge, target.M() 走 interp 反而**更安全** (无 KPM slot 不
+             * 触 UXN). 不需额外 restore. */
+            return false;
+        }
 
 #elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
         /* ============================================================
