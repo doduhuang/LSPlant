@@ -1422,29 +1422,45 @@ using ::lsplant::IsHooked;
 }
 
 void UnHookAll(JNIEnv *env) {
-    // shadowhook audit LFD-1 fix: 原实现用 range-for 直接迭代 phmap parallel_flat_hash_map
-    // 全表——parallel_flat_hash_map 的每个 submap 有独立 std::shared_mutex, range-for
-    // 不上任何锁, 与并发 Hook 触发 submap rehash 有 iterator invalidation SIGSEGV race
-    // (rehash 移动 slot → 下一次 iterator 步进读到已 dealloc 内存). Concurrent Hook 期间
-    // 触发 UnHookAll(比如 App exit + hot-reload) 会 crash 或漏 unhook (残留 trampoline
-    // 在 kpm unload 后被访问 → SIGSEGV).
+    // L1 Critical fix: 原实现收集 std::get<0>(kv.second) = reflected_backup（backup 的
+    // jobject GlobalRef），传给 UnHook(env, reflected_backup)。UnHook 内部
+    // FromReflectedMethod(reflected_backup) 得到 backup 的 ArtMethod*，命中辅助条目
+    // （reflected_backup=nullptr）→ erase_if 返回 false → 每次 unhook 静默失败
+    // = UnHookAll 完整 no-op。M6 Unload Safety 被 KPM 层独立清理掩盖。
     //
-    // 修法: 用 phmap 官方扩展 API for_each(). 底层对每个 submap 各自 SharedLock 后
-    // std::for_each, 与 Hook 侧的 emplace/erase (UniqueLock) 语义正确同步——iterator
-    // 在 lock 内构造+使用+销毁, 出 lock 前不再访问, 消除 rehash race.
+    // 修法: 收集 primary entry 的 key（target ArtMethod*，仅 reflected_backup!=nullptr
+    // 的 primary entry），直接内联 UnHook 核心逻辑。跳过 kInternalMethods 传播——
+    // UnHookAll 是全量拆卸，backup 即将失效，internal methods 指向 backup 无害。
     //
-    // Snapshot targets 到本地 vector 后释放所有 submap 锁再逐个 UnHook——UnHook 内部会
-    // 反过来对 hooked_methods_ 做 write lock, 若在 for_each 里直接调 UnHook 会 self-deadlock
-    // (SharedLock 持有中再申请 UniqueLock).
-    std::vector<jobject> targets;
+    // LFD-1 的 for_each（phmap submap SharedLock 安全遍历）保留；snapshot ArtMethod*
+    // 到本地 vector 后释放锁，再逐个做 erase_if（UniqueLock），避免 self-deadlock。
+    std::vector<art::ArtMethod*> targets;
     hooked_methods_().for_each([&targets](const auto &kv) {
-        targets.push_back(std::get<0>(kv.second));
+        if (std::get<0>(kv.second) != nullptr) {
+            targets.push_back(kv.first);
+        }
     });
-    for (auto t : targets) {
-        // UnHook 是 [[nodiscard]] bool——UnHookAll 语义是 best-effort 卸载所有,
-        // 单条失败不影响后续 (log 已在 UnHook 内部); 显式 static_cast<void> 表达
-        // 有意丢弃返回值, 消除 nodiscard 编译警告.
-        static_cast<void>(UnHook(env, t));
+    for (auto *target : targets) {
+        jobject reflected_backup = nullptr;
+        art::ArtMethod *backup = nullptr;
+        jmethodID backup_jmethodid = nullptr;
+        if (!hooked_methods_().erase_if(
+                target, [&reflected_backup, &backup, &backup_jmethodid](const auto &it) {
+                    std::tie(reflected_backup, backup, backup_jmethodid) = it.second;
+                    return reflected_backup != nullptr;
+                })) {
+            continue;
+        }
+        hooked_methods_().erase(backup);
+        backuped_proxy_methods_().erase(backup);
+#ifndef LSPLANT_M6_BACKEND
+        hooked_classes_().erase_if(target->GetDeclaringClass()->GetClassDef(), [&target](auto &it) {
+            it.second.erase(target);
+            return it.second.empty();
+        });
+#endif
+        env->DeleteGlobalRef(reflected_backup);
+        static_cast<void>(DoUnHook(target, backup));
     }
 }
 }  // extern "C++"
