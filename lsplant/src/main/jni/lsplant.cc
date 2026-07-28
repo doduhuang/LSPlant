@@ -13,6 +13,8 @@ module;
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
+#include <mutex>
 #include <string_view>
 #include <tuple>
 
@@ -74,9 +76,11 @@ extern "C" void shadowhook_pte_force_recycle_slot_for_lsplant(int slot_idx);
 extern "C" int shadowhook_m6_install_for_lsplant(void *target_oat_va,
                                                    void *trampoline_va,
                                                    int32_t *slot_out);
-extern "C" int shadowhook_m6_register_slot_for_lsplant(void *target_oat_va,
+extern "C" int shadowhook_m6_register_slot_for_lsplant(void *art_method,
+                                                        void *target_oat_va,
                                                         void *trampoline_va,
                                                         int32_t *slot_out);
+extern "C" int shadowhook_m6_is_stageable(void *target_oat_va);
 extern "C" int shadowhook_m6_smart_uninstall_for_lsplant(int32_t bridge_slot_idx,
                                                            uint64_t backup_ep);
 extern "C" int shadowhook_m6_rehook_redirect_for_lsplant(int32_t bridge_slot_idx,
@@ -99,6 +103,9 @@ extern "C" void shadowhook_ep_spoof_unregister(uintptr_t ep_field_addr);
  * art_quick_to_interpreter_bridge VA。bridge 层传给 KPM fault handler，用于
  * M6b 页命中但无 slot 匹配时重定向到解释器（修 OAT 页污染问题）。 */
 extern "C" void *g_lsplant_interp_bridge_va = nullptr;
+/* bridge/KPM 用同一个、由 ART 符号探测得到的字段偏移校验 fault 现场。
+ * 不能在内核里硬编码 ArtMethod 布局。 */
+extern "C" uint32_t g_lsplant_art_method_entry_offset = 0;
 #endif  /* LSPLANT_M6_BACKEND */
 
 module lsplant;
@@ -138,6 +145,98 @@ using art::JavaDebuggableGuard;
 using namespace std::string_view_literals;
 
 namespace {
+/*
+ * Hook bookkeeping remains published until the physical backend transition
+ * succeeds.  Serialize the complete public mutation transaction (including
+ * JNI GlobalRef and kInternalMethods housekeeping), otherwise two concurrent
+ * UnHook callers can both snapshot the same record and free it twice after
+ * taking SuspendAll in sequence.
+ */
+std::mutex &HookTransactionMutex() {
+    static std::mutex instance;
+    return instance;
+}
+
+/* A publisher may have made the candidate visible before it reports failure
+ * (or before the bridge converts a pending JNI/C++ exception into failure).
+ * Always give it an idempotent NULL rollback notification. JNI normally
+ * suppresses calls while an exception is pending, so temporarily clear and
+ * later restore the original throwable; an exception raised by rollback must
+ * never replace the failure that caused rollback. */
+void RollbackBackupPublication(
+    JNIEnv *env, const std::function<bool(jobject)> &publisher) noexcept {
+    jthrowable original_exception = nullptr;
+    if (env && env->ExceptionCheck()) {
+        original_exception = env->ExceptionOccurred();
+        env->ExceptionClear();
+    }
+
+    try {
+        if (!publisher(nullptr)) {
+            LOGE("Backup publisher rejected rollback notification");
+        }
+    } catch (...) {
+        /* A third-party C++ callback must not unwind across LSPlant. */
+        LOGE("Backup publisher threw during rollback notification");
+    }
+
+    /* A rollback callback is cleanup-only. Never let a new exception escape
+     * from it, whether or not there was an original publisher exception. */
+    if (env && env->ExceptionCheck()) env->ExceptionClear();
+    if (original_exception) {
+        if (env->Throw(original_exception) != JNI_OK) {
+            LOGE("Failed to restore publisher JNI exception after rollback");
+        }
+        env->DeleteLocalRef(original_exception);
+    }
+}
+
+#if defined(LSPLANT_SKIP_ENTRY_POINT_PATCH) && !defined(LSPLANT_M6_BACKEND)
+/*
+ * Reserve the target key before the PTE backend is touched.  The backend makes
+ * the hook executable before it returns, so inserting the record afterwards
+ * leaves an allocation-failure window in which no later UnHook can find the
+ * live slot.  Updating an existing node does not grow the hash table.
+ */
+bool PreparePteHookRecord(art::ArtMethod *target,
+                          uint64_t original_oat_va) noexcept {
+    try {
+        return pte_hook_slots_()
+            .insert({target, PteHookRecord{
+                SHADOWHOOK_SLOT_INVALID, original_oat_va}})
+            .second;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool PublishPteHookRecord(art::ArtMethod *target, int32_t slot) noexcept {
+    bool updated = false;
+    try {
+        const bool found = pte_hook_slots_().modify_if(target, [&](auto &it) {
+            if (it.second.slot_idx == SHADOWHOOK_SLOT_INVALID) {
+                it.second.slot_idx = slot;
+                updated = true;
+            }
+        });
+        return found && updated;
+    } catch (...) {
+        return false;
+    }
+}
+
+void ForgetReservedPteHookRecord(art::ArtMethod *target) noexcept {
+    try {
+        (void)pte_hook_slots_().erase_if(target, [](const auto &it) {
+            return it.second.slot_idx == SHADOWHOOK_SLOT_INVALID;
+        });
+    } catch (...) {
+        /* The process is already inside a terminal allocation/locking failure.
+         * The reserved record has no live backend slot and is safe to retain. */
+    }
+}
+#endif
+
 template <typename T, T... chars>
 inline consteval auto operator""_uarr() {
     return std::array<uint8_t, sizeof...(chars)>{static_cast<uint8_t>(chars)...};
@@ -365,8 +464,23 @@ inline void UpdateTrampoline(uint8_t offset) {
  * trampoline byte array so that GenerateTrampolineFor produces correct patches
  * for the hook ArtMethod's entry_point field. */
 bool InitNativeM6b(JNIEnv *env, const HookHandler &handler) {
+    /* These three helpers are symbol-only Function<> resolvers; unlike ART
+     * Hooker<> members they do not call info.inline_hooker or patch libart.
+     * They let the final whole-page UXN transition stop other mutators. */
+    if (!ScopedSuspendAll::Init(handler) ||
+        !Thread::Init(handler) ||
+        !ScopedGCCriticalSection::Init(handler)) {
+        LOGE("M6b: Failed to init commit suspension helpers");
+        return false;
+    }
     if (!ArtMethod::Init(env, handler)) {
         LOGE("M6b: Failed to init ArtMethod");
+        return false;
+    }
+    g_lsplant_art_method_entry_offset = ArtMethod::GetEntryPointOffset();
+    if (g_lsplant_art_method_entry_offset == 0 ||
+        g_lsplant_art_method_entry_offset > 128) {
+        LOGE("M6b: invalid ArtMethod entry-point offset");
         return false;
     }
     UpdateTrampoline(ArtMethod::GetEntryPointOffset());
@@ -668,18 +782,208 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
     return address_ptr;
 }
 
-bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
-#ifndef LSPLANT_M6_BACKEND
-    /* ScopedSuspendAll/ScopedGCCriticalSection are initialized by InitNative
-     * (via ScopedSuspendAll::Init). M6b skips InitNative (no Dobby on libart),
-     * so these objects cannot be constructed.  M6b uses direct KPM PTE/UXN
-     * install which does not require ART suspension. */
+#ifdef LSPLANT_M6_BACKEND
+/*
+ * Backend rollback 出现不确定结果后保持 sticky-false，直到进程退出。继续执行
+ * ARM_PAGES 可能把一个 caller 已看到“Hook 失败”的 redirect 发布出去，因此这里
+ * 宁可拒绝整个后续 transaction，也不尝试猜测单个 slot 的内核状态。
+ */
+std::atomic<bool> g_m6_transaction_healthy{true};
+
+enum class M6RollbackDisposition {
+    kRemoved,
+    kPassThrough,
+    kPoisoned,
+};
+
+bool ReadM6HookRecord(ArtMethod *target, M6HookRecord *out) noexcept {
+    if (!out) return false;
+    try {
+        return m6_hook_slots_().if_contains(
+            target, [out](const auto &it) { *out = it.second; });
+    } catch (...) {
+        g_m6_transaction_healthy.store(false, std::memory_order_release);
+        return false;
+    }
+}
+
+bool PrepareM6HookRecord(ArtMethod *target, uint64_t target_oat_va) noexcept {
+    try {
+        return m6_hook_slots_()
+            .insert({target, M6HookRecord{
+                -1, target_oat_va, false, 0, M6HookRecord::State::kRegistering}})
+            .second;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool TransitionM6HookRecord(ArtMethod *target, int32_t slot,
+                            M6HookRecord::State state) noexcept {
+    bool updated = false;
+    try {
+        bool found = m6_hook_slots_().modify_if(target, [&](auto &it) {
+            /* 注册发布只允许 -1 → slot；之后的状态迁移必须仍指向同一 bridge slot。
+             * 这也防住同 target 非法并发 Hook 把另一笔 transaction 的记录改坏。 */
+            if ((it.second.state == M6HookRecord::State::kRegistering &&
+                 it.second.slot_idx == -1) ||
+                it.second.slot_idx == slot) {
+                it.second.slot_idx = slot;
+                it.second.state = state;
+                updated = true;
+            }
+        });
+        return found && updated;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool EraseM6HookRecord(ArtMethod *target, int32_t slot) noexcept {
+    try {
+        return m6_hook_slots_().erase_if(target, [slot](const auto &it) {
+            return it.second.slot_idx == slot ||
+                   (slot >= 0 &&
+                    it.second.state == M6HookRecord::State::kRegistering &&
+                    it.second.slot_idx == -1);
+        });
+    } catch (...) {
+        return false;
+    }
+}
+
+void PoisonM6Transaction(ArtMethod *target, int32_t slot) noexcept {
+    /* 状态写失败也不能重新开放 transaction：atomic sticky gate 是最终防线。 */
+    (void)TransitionM6HookRecord(target, slot, M6HookRecord::State::kPoisoned);
+    g_m6_transaction_healthy.store(false, std::memory_order_release);
+}
+
+M6RollbackDisposition RollbackM6Registration(ArtMethod *target, int32_t slot,
+                                              uint64_t pass_through_ep) noexcept {
+    int rc = shadowhook_m6_smart_uninstall_for_lsplant(slot, pass_through_ep);
+    if (rc == 0) {
+        /* 只有 backend 明确完成 full uninstall 才允许删除 slot 元数据。 */
+        if (EraseM6HookRecord(target, slot)) return M6RollbackDisposition::kRemoved;
+        PoisonM6Transaction(target, slot);
+        return M6RollbackDisposition::kPoisoned;
+    }
+    if (rc == 1) {
+        /* 同页仍武装：KPM 已把该 method 改为解释器 pass-through，保留 slot
+         * 供下一次 Hook 走 rehook_redirect。 */
+        if (TransitionM6HookRecord(
+                target, slot, M6HookRecord::State::kPassThrough)) {
+            return M6RollbackDisposition::kPassThrough;
+        }
+        PoisonM6Transaction(target, slot);
+        return M6RollbackDisposition::kPoisoned;
+    }
+
+    /* rc<0 表示既不能证明 slot 已删除，也不能证明已安全 pass-through。保留
+     * m6_hook_slots_ + hooked_methods_ + GlobalRef，并阻断后续 ARM_PAGES。 */
+    PoisonM6Transaction(target, slot);
+    return M6RollbackDisposition::kPoisoned;
+}
+#endif
+
+bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
+            const art::dex::ClassDef *hooked_class_def,
+            const art::dex::ClassDef *deoptimized_class_def,
+            bool is_proxy,
+            jobject reflected_backup, jmethodID backup_jmethodid,
+            jmethodID target_jmethodid, bool *out_recorded) {
+    if (out_recorded) *out_recorded = false;
+    /* M6's symbol-only InitNativeM6b initializes these helpers without
+     * patching libart. ArtMethod::BackupTo/CopyFrom and access-flag changes
+     * must therefore obey the same stop-the-world contract as normal LSPlant. */
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant Hook", false);
-#endif  /* LSPLANT_M6_BACKEND */
     LOGV("Hooking: target = %s(%p), hook = %s(%p), backup = %s(%p)", target->PrettyMethod().c_str(),
          target, hook->PrettyMethod().c_str(), hook, backup->PrettyMethod().c_str(), backup);
+
+    /* Publish all fallible bookkeeping while the same SuspendAll boundary that
+     * protects ArtMethod mutation is active, but before touching either method.
+     * This prevents a concurrent class-initialization callback from observing a
+     * hooked_classes_ entry whose target still has the old entry point. */
+    if (!RecordHooked(target, hooked_class_def, reflected_backup, backup,
+                      backup_jmethodid, target_jmethodid)) {
+        LOGE("Failed to record hook transaction");
+        return false;
+    }
+    if (out_recorded) *out_recorded = true;
+
+    HookAuxRecords aux_records{};
+#ifndef LSPLANT_M6_BACKEND
+    if (!RecordHookAuxRecords(
+            target, backup, is_proxy, deoptimized_class_def, &aux_records)) {
+        LOGE("Failed to reserve auxiliary hook bookkeeping");
+        ForgetHookedRecord(target, hooked_class_def, backup);
+        if (out_recorded) *out_recorded = false;
+        return false;
+    }
+#endif
+
+    struct HookRecordGuard {
+        ArtMethod *target;
+        const art::dex::ClassDef *class_def;
+        const art::dex::ClassDef *deoptimized_class_def;
+        ArtMethod *backup;
+        HookAuxRecords *aux_records;
+        bool *out_recorded;
+        uint32_t original_access_flags;
+        bool committed = false;
+
+        ~HookRecordGuard() {
+            if (committed) return;
+#ifdef LSPLANT_M6_BACKEND
+            /* An ambiguous backend rollback intentionally retains the record
+             * and GlobalRef for UnHookAll/restart containment. */
+            if (!g_m6_transaction_healthy.load(std::memory_order_acquire)) return;
+#endif
+            /* SetNonIntrinsic/BackupTo/SetNonCompilable only mutate the target's
+             * access flags before the backend's commit point.  Restore the exact
+             * pre-transaction value on every definite failure so a rejected Hook
+             * has no residual ArtMethod mutation. */
+            target->SetAccessFlags(original_access_flags);
+            ForgetHookAuxRecords(
+                target, backup, deoptimized_class_def, aux_records);
+            ForgetHookedRecord(target, class_def, backup);
+            if (out_recorded) *out_recorded = false;
+        }
+    } record_guard{target, hooked_class_def, deoptimized_class_def, backup,
+                   &aux_records, out_recorded, target->GetAccessFlags()};
+
+#ifdef LSPLANT_M6_BACKEND
+    if (!g_m6_transaction_healthy.load(std::memory_order_acquire)) {
+        LOGE("M6b DoHook: transaction poisoned; process restart required");
+        return false;
+    }
+
+    M6HookRecord existing_m6_record{};
+    const bool has_existing_m6_record =
+        ReadM6HookRecord(target, &existing_m6_record);
+    if (!g_m6_transaction_healthy.load(std::memory_order_acquire)) {
+        LOGE("M6b DoHook: unable to read transaction metadata");
+        return false;
+    }
+    if (has_existing_m6_record &&
+        (existing_m6_record.slot_idx < 0 ||
+         existing_m6_record.state != M6HookRecord::State::kPassThrough)) {
+        /* 正常 rehook 只可能来自 rc=1 的 pass-through。其它残留状态表示
+         * hooked_methods_ 与 backend 元数据失配，不能继续生成/提交新 redirect。 */
+        PoisonM6Transaction(target, existing_m6_record.slot_idx);
+        LOGE("M6b DoHook: stale non-pass-through slot metadata");
+        return false;
+    }
+
+    /* Fail before GenerateTrampoline/BackupTo/access-flag mutation.  System
+     * boot-image and interpreter entry points have no staged Pixel 6 backend;
+     * the former shim fallback published too early and is intentionally gone. */
+    if (!shadowhook_m6_is_stageable(target->GetEntryPoint())) {
+        LOGE("M6b DoHook: target entry point is not stageable");
+        return false;
+    }
+#endif
 
     if (auto *entrypoint = GenerateTrampolineFor(hook); !entrypoint) {
         LOGE("Failed to generate trampoline");
@@ -713,11 +1017,21 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          * m6_hook_slots_ 仍保有 bridge_slot_idx 记录；直接更新 redirect_va 即可，
          * 无需重新 install（KPM slot 和 UXN 仍在位）。 */
         {
-            int32_t existing_bridge_slot = -1;
-            m6_hook_slots_().if_contains(target, [&existing_bridge_slot](const auto &it) {
-                existing_bridge_slot = it.second.slot_idx;
-            });
+            const int32_t existing_bridge_slot =
+                has_existing_m6_record ? existing_m6_record.slot_idx : -1;
             if (existing_bridge_slot >= 0) {
+                /* This DoHook created a fresh backup ArtMethod above.  Make
+                 * that backup callable before staging the KPM redirect; if
+                 * ART refuses, the existing pass-through slot remains wholly
+                 * untouched and the caller gets a real failure. */
+                if (!backup->IsNative() &&
+                    !ClassLinker::SetEntryPointsToInterpreter(backup)) {
+                    LOGE("M6b DoHook rehook: SetEntryPointsToInterpreter(backup) failed");
+                    return false;
+                }
+                if (!g_lsplant_interp_bridge_va) {
+                    g_lsplant_interp_bridge_va = backup->GetEntryPoint();
+                }
                 int rc = shadowhook_m6_rehook_redirect_for_lsplant(
                              existing_bridge_slot,
                              reinterpret_cast<uint64_t>(entrypoint));
@@ -727,24 +1041,16 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                          existing_bridge_slot, entrypoint, rc);
                     return false;
                 }
-                /* backup 的 entry_point 在 DoHook 原 install 时已被
-                 * SetEntryPointsToInterpreter 改成 interp bridge；DoUnHook partial
-                 * 路径不清 entry_point，这里重新确保为 interp（防 ART 在 DoUnHook
-                 * CopyFrom 后改回 OAT VA）。
-                 * native 方法跳过——backup 走 JNI bridge，不经 OAT/UXN 页，无需改 interp。
-                 *
-                 * shadowhook audit LFD-2 fix: 此调用是 belt-and-suspenders (双保险)——
-                 * Phase B partial UnHook 已把 backup 设为 interp, rehook 时不改也不会破
-                 * hook 语义 (KPM slot 重定向 target 到 new trampoline; backup.invoke()
-                 * 走 interp 正确). SetEntryPointsToInterpreter fail 时**不 return false**
-                 * (否则 caller 认为 hook 失败但 KPM 已 armed, 状态不一致); 改 LOGW 保留
-                 * hook 装载, 仍 return true. */
-                if (!backup->IsNative() &&
-                    !ClassLinker::SetEntryPointsToInterpreter(backup)) {
-                    LOGW("M6b DoHook rehook: SetEntryPointsToInterpreter(backup) failed "
-                         "— proceeding (backup already at interp from Phase B partial UnHook)");
+                if (!TransitionM6HookRecord(
+                        target, existing_bridge_slot,
+                        M6HookRecord::State::kStaged)) {
+                    /* KPM 已进入 pending rehook；没有可靠 metadata 时绝不能让
+                     * nativeEndHookBatch/commit_hooks 发布它。 */
+                    PoisonM6Transaction(target, existing_bridge_slot);
+                    LOGE("M6b DoHook rehook: failed to publish staged metadata");
+                    return false;
                 }
-                /* m6_hook_slots_ 记录不变（bridge_slot + original_oat_va 均正确）。*/
+                record_guard.committed = true;
                 return true;
             }
         }
@@ -755,6 +1061,13 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          * entry_point 字段，所以此处读到的仍是原始 OAT VA。 */
         uint64_t target_oat_va = reinterpret_cast<uint64_t>(target->GetEntryPoint());
 
+        /* KPM syscall 前先预占 map 节点。register 成功后仅 modify_if 原位写 slot，
+         * 不再经过任何可能 OOM 的 hash-table 分配窗口。 */
+        if (!PrepareM6HookRecord(target, target_oat_va)) {
+            LOGE("M6b DoHook: failed to reserve slot metadata");
+            return false;
+        }
+
         /* Step 2: 注册 M6 slot（延迟武装——UXN 由 nativeEndHookBatch 批量 arm）。
          * 延迟武装原因：Hooker.java 的 OAT continuation code（nativeInitAndHook JNI return 之后）
          * 与 Target.M1 entry 可能在同一 4KB OAT 页；若 DoHook 内立刻 arm UXN，
@@ -762,12 +1075,35 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          * 解决：DoHook 仅注册 slot（不 arm），所有 Hooker.hook() 返回后统一 arm。 */
         int32_t m6_slot = -1;
         int m6_rc = shadowhook_m6_register_slot_for_lsplant(
-            reinterpret_cast<void *>(target_oat_va), entrypoint, &m6_slot);
+            target, reinterpret_cast<void *>(target_oat_va), entrypoint, &m6_slot);
+        if (m6_rc == SH_M6_OK && m6_slot >= 0) {
+            /* register 成功后的第一项用户态动作：发布 bridge slot。 */
+            if (!TransitionM6HookRecord(
+                    target, m6_slot, M6HookRecord::State::kStaged)) {
+                LOGE("M6b DoHook: registered slot metadata publish failed");
+                (void)RollbackM6Registration(
+                    target, m6_slot,
+                    reinterpret_cast<uint64_t>(backup->GetEntryPoint()));
+                return false;
+            }
+        }
         /* R2-CM-04 治本 (审计 Medium): 严格区分 SH_M6_E_INVAL (/apex/ VA 合法拒绝, 走
          * shim fallback) 与 SH_M6_E_NOSPC / 其他 (slot 表满 or 通用错误, 直接 return
          * false 不 fallback). 之前 `m6_rc != 0 || m6_slot < 0` 把两情况混, slot 满时
          * 也走 fallback 泄漏 shim 页 + 破坏 M6b 主路径承诺. */
         if (m6_rc == SH_M6_E_INVAL) {
+            if (!EraseM6HookRecord(target, -1)) {
+                PoisonM6Transaction(target, -1);
+            }
+            /* Pixel 6's staged backend cannot include the legacy /apex/
+             * entry-point shim in ARM_PAGES: SetEntryPoint would publish the
+             * hook immediately, before the Java/plugin transaction commits.
+             * Reject system/boot-image methods explicitly until they have a
+             * genuinely staged backend. */
+            LOGE("M6b DoHook: target is not KPM-stageable; entry-point shim "
+                 "fallback disabled on Pixel 6");
+            return false;
+#if 0
             /* ── /apex/ 系统类 entry_point fallback ──────────────────────────────
              * register_slot 明确以 SH_M6_E_INVAL 拒绝: target OAT VA 在 boot image
              * (/apex/, 跨进程共享, 不能 PTE/UXN). 回退到上游 LSPlant 原版机制——改
@@ -810,7 +1146,8 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
             try {
                 /* 记录 fallback：slot_idx=-1，shim_va 供 DoUnHook munmap。 */
                 m6_hook_slots_().insert({target, M6HookRecord{
-                    -1, target_oat_va, true, reinterpret_cast<uint64_t>(shim)}});
+                    -1, target_oat_va, true, reinterpret_cast<uint64_t>(shim),
+                    M6HookRecord::State::kStaged}});
                 /* EP Spoof 注册：让 bridge + KPM 侧的 spoof 表知道此 ArtMethod+24 对应的
                  * 原始 OAT VA，RASP pread64 hook 拦截读 entry_point 字段时返回原始值。 */
                 shadowhook_ep_spoof_register(
@@ -822,9 +1159,14 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
                 shadowhook_m6_free_named_shim(shim);
                 return false;
             }
+            record_guard.committed = true;
             return true;
+#endif
         }
         if (m6_rc != SH_M6_OK || m6_slot < 0) {
+            if (!EraseM6HookRecord(target, -1)) {
+                PoisonM6Transaction(target, -1);
+            }
             /* R2-CM-04: 非 -EINVAL 类错误 (slot 表满 SH_M6_E_NOSPC / kallsyms 未 resolve
              * SH_M6_E_NOENT / 通用错误 SH_M6_E_GENERIC 等) 明确 return false 让 caller
              * 感知 hook 失败, 不静默走 shim fallback 掩盖 slot 表满等结构性问题. */
@@ -839,7 +1181,8 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
         if (!backup->IsNative() &&
             !ClassLinker::SetEntryPointsToInterpreter(backup)) {
             LOGE("M6b DoHook: SetEntryPointsToInterpreter(backup) failed — rollback");
-            shadowhook_m6_smart_uninstall_for_lsplant(m6_slot,
+            (void)RollbackM6Registration(
+                target, m6_slot,
                 reinterpret_cast<uint64_t>(backup->GetEntryPoint()));
             return false;
         }
@@ -847,20 +1190,7 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
             g_lsplant_interp_bridge_va = backup->GetEntryPoint();
         }
 
-        /* Step 4: 记录 slot + original VA 供 DoUnHook
-         * shadowhook audit BLG-1 fix: phmap::insert bad_alloc rollback KPM slot + backup interp. */
-        try {
-            m6_hook_slots_().insert({target, M6HookRecord{m6_slot, target_oat_va, false, 0}});
-        } catch (const std::bad_alloc &) {
-            LOGE("M6b DoHook: phmap insert bad_alloc — rollback KPM slot");
-            shadowhook_m6_smart_uninstall_for_lsplant(m6_slot,
-                reinterpret_cast<uint64_t>(backup->GetEntryPoint()));
-            /* backup->entry_point 仍是 interp bridge (SetEntryPointsToInterpreter 结果),
-             * caller 的 CopyFrom 会把它拷回 target—— target.entry_point 从 boot OAT VA
-             * 变成 interp bridge, target.M() 走 interp 反而**更安全** (无 KPM slot 不
-             * 触 UXN). 不需额外 restore. */
-            return false;
-        }
+        /* slot 元数据已在 register 后立即发布；此处无可分配/失败步骤。 */
 
 #elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
         /* ============================================================
@@ -888,10 +1218,15 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          *   _ex 版回传 slot_idx；存入 pte_hook_slots_(target) → DoUnHook 用同 key
          *   查回再调 shadowhook_pte_uninstall_for_lsplant 拆 KPM 端 slot. */
         uint64_t target_oat_va = reinterpret_cast<uint64_t>(target->GetEntryPoint());
+        if (!PreparePteHookRecord(target, target_oat_va)) {
+            LOGE("M4b PTE failed to reserve slot metadata before install");
+            return false;
+        }
         int pte_slot = SHADOWHOOK_SLOT_INVALID;
         void *pte_backup = shadowhook_pte_install_for_lsplant_ex(
                               reinterpret_cast<void *>(target_oat_va), entrypoint, &pte_slot);
         if (!pte_backup) {
+            ForgetReservedPteHookRecord(target);
             LOGE("M4b PTE shadowhook_pte_install_for_lsplant_ex(.oat=%p, entrypoint=%p) failed slot=%d",
                  (void *)target_oat_va, entrypoint, pte_slot);
             return false;
@@ -907,7 +1242,34 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
          * pte_slot == SHADOWHOOK_SLOT_INVALID 表 install 完全失败，但本路径 pte_backup==null
          * 已 return false，不会走到这里. */
         if (pte_slot >= 0 || pte_slot == SHADOWHOOK_SLOT_FALLBACK_DOBBY) {
-            pte_hook_slots_().insert({target, {pte_slot, target_oat_va}});
+            if (!PublishPteHookRecord(target, pte_slot)) {
+                /* The key was reserved before install, so this path should
+                 * only be reachable after an exceptional map failure.  Undo
+                 * the now-live backend before returning failure. */
+                long rollback_rc = -16;
+                for (int retry = 0; retry < 4 && rollback_rc == -16; ++retry) {
+                    rollback_rc = shadowhook_pte_uninstall_for_lsplant(
+                        pte_slot, reinterpret_cast<void *>(target_oat_va));
+                    if (rollback_rc == -16) sched_yield();
+                }
+                if (rollback_rc == 0) {
+                    ForgetReservedPteHookRecord(target);
+                } else {
+                    /* Returning would expose a live hook whose bookkeeping
+                     * could not be published.  Keep the process inside this
+                     * stack frame and fail-stop instead. */
+                    LOGE("M4b PTE backend rollback remained ambiguous");
+                    std::abort();
+                }
+                LOGE("M4b PTE slot metadata publish failed; backend rollback rc=%ld",
+                     rollback_rc);
+                return false;
+            }
+        } else {
+            /* A non-null backup means the backend may already be active, but
+             * without a valid slot id it cannot be restored or tracked. */
+            LOGE("M4b PTE install returned an invalid slot id");
+            std::abort();
         }
 #else
         target->SetEntryPoint(entrypoint);   /* M4a 原路径：改 entry_point 到 trampoline */
@@ -917,17 +1279,18 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup) {
              target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
              backup->GetEntryPoint(), hook, hook->GetAccessFlags(), hook->GetEntryPoint());
 
+        record_guard.committed = true;
         return true;
     }
 }
 
-bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
-#ifndef LSPLANT_M6_BACKEND
-    /* Same rationale as DoHook: ScopedSuspendAll requires InitNative, which M6b skips. */
+bool DoUnHook(ArtMethod *target, ArtMethod *backup,
+              const art::dex::ClassDef *hooked_class_def) {
+    /* DoUnHook restores the complete ArtMethod body. Keep it inside the same
+     * ART suspension boundary in every backend, including Pixel 6 M6. */
     ScopedGCCriticalSection section(art::Thread::Current(), art::gc::kGcCauseDebugger,
                                     art::gc::kCollectorTypeDebugger);
-    ScopedSuspendAll suspend("LSPlant Hook", false);
-#endif  /* LSPLANT_M6_BACKEND */
+    ScopedSuspendAll suspend("LSPlant UnHook", false);
     LOGV("Unhooking: target = %p, backup = %p", target, backup);
 #ifdef LSPLANT_M6_BACKEND
     /* M6b DoUnHook: smart_uninstall KPM slot + restore backup entry_point → original OAT VA
@@ -938,24 +1301,26 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
      *   1 = partial：同一 OAT 页上仍有其他方法处于 hook 状态，UXN 保留；
      *       KPM fault handler 已把 redirect_va 改为 backup_ep（ART interp bridge），
      *       使 target 执行效果为「已卸钩」但 m6_hook_slots_ 记录保留（Phase C rehook 依赖）。
-     *  <0 = error：fallthrough restore + erase 让下次 re-hook 有机会。
+     *  <0 = error：保留 slot、backup 与 LSPlant 记录，向上传播失败并允许重试。
      *
      * Note: target's entry_point was never modified by DoHook (M6b uses PTE.UXN=1
      * instead), so after full uninstall the OAT page becomes executable again and the
      * original entry_point in target is still valid — target resumes normal execution
      * after CopyFrom restores the full ArtMethod body. */
     {
-        int32_t  bridge_slot = -1;
-        uint64_t orig_va     = 0;
-        bool     is_fallback = false;
-        uint64_t shim_va     = 0;
-        m6_hook_slots_().if_contains(target,
-            [&bridge_slot, &orig_va, &is_fallback, &shim_va](const auto &it) {
-                bridge_slot = it.second.slot_idx;
-                orig_va     = it.second.original_oat_va;
-                is_fallback = it.second.is_entry_point_fallback;
-                shim_va     = it.second.shim_va;
-            });
+        M6HookRecord record{};
+        const bool has_record = ReadM6HookRecord(target, &record);
+        if (!has_record) {
+            /* hooked_methods_ 仍声明已 hook，但 backend 元数据缺失；任何继续 commit
+             * 都可能发布孤儿 slot，故 sticky poison。 */
+            PoisonM6Transaction(target, -1);
+            LOGE("M6b DoUnHook: no M6 slot record for target");
+            return false;
+        }
+        int32_t  bridge_slot = record.slot_idx;
+        uint64_t orig_va     = record.original_oat_va;
+        bool     is_fallback = record.is_entry_point_fallback;
+        uint64_t shim_va     = record.shim_va;
         if (is_fallback) {
             /* entry_point fallback 卸钩：无 KPM/UXN，无 partial 状态。把 backup
              * entry_point 还原为原 OAT VA（下方 CopyFrom 把它传回 target.entry_point
@@ -977,7 +1342,12 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
                 /* Full uninstall: UXN cleared, KPM slot freed, bridge slot cleared.
                  * 把 backup entry_point 恢复到原 OAT VA，CopyFrom 会把它传回 target。*/
                 backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
-                m6_hook_slots_().erase(target);
+                if (!EraseM6HookRecord(target, bridge_slot)) {
+                    /* backend 已清但 stale metadata 会让后续 rehook 使用已释放 slot。 */
+                    PoisonM6Transaction(target, bridge_slot);
+                    LOGE("M6b DoUnHook: full uninstall metadata erase failed");
+                    return false;
+                }
             } else if (rc == 1) {
                 /* Partial uninstall: 同一 OAT 页上还有其他方法 hook 在位。
                  * KPM slot redirect_va 已改为 backup_ep（interp bridge）；
@@ -990,17 +1360,26 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
                  * 字段，但 ART fast dispatch 读它——partial unhook 后 target 仍
                  * 期望走 OAT VA 触发 fault handler，不能变成 interp bridge VA）。*/
                 backup->SetEntryPoint(target->GetEntryPoint());
+                if (!TransitionM6HookRecord(
+                        target, bridge_slot,
+                        M6HookRecord::State::kPassThrough)) {
+                    PoisonM6Transaction(target, bridge_slot);
+                    LOGE("M6b DoUnHook: pass-through metadata publish failed");
+                    return false;
+                }
             } else {
                 LOGE("M6b DoUnHook: smart_uninstall(bridge=%d) failed rc=%d;"
                      " PTE.UXN may still be armed — target SIGSEGV risk.",
                      bridge_slot, rc);
-                /* Fallthrough: restore and erase to allow future re-hook attempt. */
-                backup->SetEntryPoint(reinterpret_cast<void *>(orig_va));
-                m6_hook_slots_().erase(target);
+                /* Preserve backup, slot metadata and LSPlant bookkeeping.
+                 * Poison also makes every later ARM_PAGES gate fail closed. */
+                PoisonM6Transaction(target, bridge_slot);
+                return false;
             }
         } else {
-            LOGE("M6b DoUnHook: no M6 slot record for target — restoring from target");
-            backup->SetEntryPoint(target->GetEntryPoint());
+            PoisonM6Transaction(target, bridge_slot);
+            LOGE("M6b DoUnHook: invalid M6 slot state");
+            return false;
         }
     }
 #elif defined(LSPLANT_SKIP_ENTRY_POINT_PATCH)
@@ -1033,35 +1412,9 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
             sched_yield();
         }
         if (rc != 0) {
-            /* [M4b-Polish I3 fix, codex round 4+5 P2]: uninstall 失败现实困境的两层处理：
-             *
-             *   ① PTE 主路径 (slot_for_target >= 0)：调 force_recycle 标记 KPM slot 为 stuck
-             *      (PTE 仍 UXN-armed + do_mem_abort handler 仍服务 → target App 不会 SIGSEGV).
-             *      LSPlant 视角已"unhooked"但 KPM hook 仍生效；可通过 SH_CMD_PTE_HOOK_STUCK_COUNT
-             *      0x7006 查询 stuck 总数, controller 决定是否 kill app + reload KPM.
-             *
-             *   ② Dobby fallback (slot_for_target == SHADOWHOOK_SLOT_FALLBACK_DOBBY)：rc 来自 DobbyDestroy. 与 PTE telemetry
-             *      无关，不走 force_recycle. Dobby far trampoline 可能 leak.
-             *
-             * 真正的根治需要把 UnHook 上层的 erase 移到 DoUnHook 之后 (lsplant 上游 PR). */
-            if (slot_for_target >= 0) {
-                /* 真 PTE slot path: mark stuck for telemetry (codex round 2 P1 fix: 不能清 used)
-                 * codex round 7 P3 fix: rc 是 long, 用 %ld. */
-                LOGE("M4b-PTE shadowhook_pte_uninstall_for_lsplant(slot=%d, .oat=%p) failed rc=%ld; "
-                     "marking slot as stuck (telemetry-only: PTE 仍 UXN-armed, do_mem_abort handler 仍服务; "
-                     "ghost+slot leak ~16KB+1 entry, query SH_CMD_PTE_HOOK_STUCK_COUNT 决定 reload).",
-                     slot_for_target, (void *)original_oat_va, rc);
-                /* M4b-Polish I3 (telemetry-only after codex P1): 仅打 stuck 标记, 不释放 slot.
-                 * 真正根治 = 移 erase 到 DoUnHook 之后 (上游 PR), 留 follow-up. */
-                shadowhook_pte_force_recycle_slot_for_lsplant(slot_for_target);
-            } else {
-                /* Dobby fallback path: rc 来自 DobbyDestroy. 与 PTE telemetry 无关.
-                 * codex round 7 P3 fix: rc 是 long, 用 %ld. */
-                LOGE("M4b-Dobby-fallback DobbyDestroy(.oat=%p) failed rc=%ld (slot_for_target=%d sentinel); "
-                     "Dobby far trampoline 可能 leak, 但不计入 PTE stuck_count.",
-                     (void *)original_oat_va, rc, slot_for_target);
-            }
-            /* fallthrough: erase 跟踪 + restore entry_point. */
+            LOGE("DoUnHook backend restore failed slot=%d rc=%ld; preserving hook record for retry",
+                 slot_for_target, rc);
+            return false;
         }
         /* [R2 P1-C 修] 还原 backup.entry_point → original_oat_va：
          * - PTE 路径：pte_backup ghost VA 可能已被 uninstall 释放（成功路径）或仍在（失败路径）
@@ -1071,11 +1424,18 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
          * call_original 之后用 backup 调用：原 .oat 段（成功路径 PTE restore UXN=0）安全可执行. */
         backup->SetEntryPoint(reinterpret_cast<void *>(original_oat_va));
         pte_hook_slots_().erase(target);
+    } else {
+        LOGE("DoUnHook: no PTE/Dobby slot record for target");
+        return false;
     }
 #endif
     auto access_flags = target->GetAccessFlags();
     target->CopyFrom(backup);
     target->SetAccessFlags(access_flags);
+    /* Retire target/backup/class bookkeeping before mutators resume.  A
+     * physical restore failure returns above and deliberately keeps every
+     * record published for a later retry. */
+    ForgetHookedRecord(target, hooked_class_def, backup);
     LOGV("Done unhook: target(%p:0x%x) -> %p; backup(%p:0x%x) -> %p;", target,
          target->GetAccessFlags(), target->GetEntryPoint(), backup, backup->GetAccessFlags(),
          backup->GetEntryPoint());
@@ -1159,25 +1519,55 @@ using ::lsplant::IsHooked;
 #ifndef LSPLANT_M6_BACKEND
         /* InitNative installs ~35 Dobby inline hooks on libart functions
          * (FixupStaticTrampolines, ClassLinker::InitializeClass, etc.).
-         * M6b skips it so libart .text stays physically unmodified — the
-         * entire point of the M6b backend.  ScopedSuspendAll::Init is also
-         * part of InitNative; since it is not called, ScopedSuspendAll
-         * objects cannot be constructed in DoHook/DoUnHook (gated by
-         * #ifndef LSPLANT_M6_BACKEND there). */
+         * The retired M6 source configuration skips those inline hooks and
+         * initializes only the symbol-resolved suspension subset below. */
         && InitNative(env, info)
 #else
         /* M6b: call only the Dobby-free subset needed for DoHook.
          * ArtMethod::Init sets art_method_field + access_flags_offset (no
-         * Dobby hooks on API 33).  ClassLinker::InitM6b resolves only the
-         * interpreter bridge entry point (no hooks, .as<> lookups only). */
+         * Dobby hooks on API 33). ScopedSuspendAll/Thread/GC helpers are
+         * symbol-only resolvers, and ClassLinker::InitM6b resolves only the
+         * interpreter bridge entry point. */
         && InitNativeM6b(env, info)
 #endif  /* LSPLANT_M6_BACKEND */
         ;
     return kInit;
 }
 
-[[maybe_unused]] jobject Hook(JNIEnv *env, jobject target_method, jobject hooker_object,
-                              jobject callback_method) {
+[[maybe_unused]] bool M6TransactionHealthy() {
+#ifdef LSPLANT_M6_BACKEND
+    return g_m6_transaction_healthy.load(std::memory_order_acquire);
+#else
+    return true;
+#endif
+}
+
+[[maybe_unused]] bool M6CommitWithSuspendedThreads(
+        const std::function<bool()> &commit) {
+    if (!commit) return false;
+#ifdef LSPLANT_M6_BACKEND
+    if (!M6TransactionHealthy()) return false;
+    auto *self = Thread::Current();
+    if (!self) return false;
+    ScopedGCCriticalSection section(
+        self, art::gc::kGcCauseDebugger, art::gc::kCollectorTypeDebugger);
+    ScopedSuspendAll suspend("LSPlant M6 commit", false);
+    return M6TransactionHealthy() && commit();
+#else
+    return commit();
+#endif
+}
+
+static jobject HookImpl(
+    JNIEnv *env, jobject target_method, jobject hooker_object,
+    jobject callback_method,
+    const std::function<bool(jobject)> *backup_publisher) {
+#ifdef LSPLANT_M6_BACKEND
+    if (!M6TransactionHealthy()) {
+        LOGE("M6 Hook rejected: transaction poisoned; process restart required");
+        return nullptr;
+    }
+#endif
     if (!target_method || !JNI_IsInstanceOf(env, target_method, executable)) {
         LOGE("target method is not an executable");
         return nullptr;
@@ -1197,6 +1587,7 @@ using ::lsplant::IsHooked;
     bool is_proxy = JNI_GetIntField(env, target_class, class_access_flags) & kAccClassIsProxy;
     auto *target = ArtMethod::FromReflectedMethod(env, target_method);
     bool is_static = target->IsStatic();
+    std::lock_guard transaction_guard(HookTransactionMutex());
 
     if (IsHooked(target, true)) {
         LOGW("Skip duplicate hook");
@@ -1253,40 +1644,119 @@ using ::lsplant::IsHooked;
     // 注：backup_method（JNI_GetMethodID 取的）在 pointer-id 模式下 == (jmethodID)ArtMethod*，
     // 在 opaque-id 模式下是合法的 opaque index——两种模式均安全。
     jmethodID backup_jmethodid = backup_method;
+    jmethodID target_jmethodid = env->FromReflectedMethod(target_method);
+    jobject global_backup = JNI_NewGlobalRef(env, reflected_backup);
+    if (!global_backup) {
+        LOGE("Failed to retain reflected backup");
+        return nullptr;
+    }
 
-    if (DoHook(target, hook, backup)) {
+    /* A native plugin cannot safely publish the backup after Hook() returns:
+     * the normal Dobby backend is already live at that point, so another
+     * mutator may enter the callback first. Give the bridge the fully created
+     * backup while target is still untouched. A rejected publication leaves
+     * no hook or LSPlant bookkeeping behind. */
+    bool backup_published = false;
+    if (backup_publisher) {
+        bool accepted = false;
+        try {
+            accepted = (*backup_publisher)(global_backup);
+        } catch (...) {
+            /* Treat an escaping C++ publisher exactly like any other rejected
+             * publication, including its mandatory NULL rollback. */
+            LOGE("Backup publisher threw while publishing hook");
+        }
+        if (!accepted || env->ExceptionCheck()) {
+            RollbackBackupPublication(env, *backup_publisher);
+            env->DeleteGlobalRef(global_backup);
+            LOGE("Backup publisher rejected hook or left a pending exception");
+            return nullptr;
+        }
+        backup_published = true;
+    }
+
+    const art::dex::ClassDef *hooked_class_def = nullptr;
+    const art::dex::ClassDef *deoptimized_class_def = nullptr;
+#ifndef LSPLANT_M6_BACKEND
+    hooked_class_def = target->GetDeclaringClass()->GetClassDef();
+    deoptimized_class_def = hook->GetDeclaringClass()->GetClassDef();
+#endif
+    bool hook_recorded = false;
+    bool installed = false;
+    try {
+        installed = DoHook(
+            target, hook, backup, hooked_class_def,
+            deoptimized_class_def, is_proxy, global_backup,
+            backup_jmethodid, target_jmethodid, &hook_recorded);
+    } catch (...) {
+        /* No C++ exception may cross JNI/plugin ABI. On the supported Dobby
+         * path every potentially throwing allocation occurs before target
+         * activation, and DoHook's record guard restores pre-commit state. */
+        LOGE("Unexpected exception while installing hook");
+        installed = false;
+    }
+    if (installed) {
         std::apply(
-            [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
-                ((*v == target_method_id &&
+            [backup_method, target_jmethodid](auto... v) {
+                ((*v == target_jmethodid &&
                   (LOGD("Propagate internal used method because of hook"), *v = backup_method)) ||
                  ...);
             },
             kInternalMethods);
-        jobject global_backup = JNI_NewGlobalRef(env, reflected_backup);
-#ifdef LSPLANT_M6_BACKEND
-        /* M6b: Class::Init is not called (avoids Dobby hooks on libart), so
-         * GetClassDef_ is unresolved (null).  hooked_classes_ / deoptimized_classes_ /
-         * deoptimized_methods_set_ are never consulted in M6b (no SetStatus_ /
-         * FixupStaticTrampolines handlers).  Pass nullptr as class_def; hooked_methods_
-         * is still populated so UnHook can find and remove the entry. */
-        RecordHooked(target, nullptr, global_backup, backup, backup_jmethodid);
-#else
-        RecordHooked(target, target->GetDeclaringClass()->GetClassDef(), global_backup, backup,
-                     backup_jmethodid);
-        if (!is_proxy) [[likely]] {
-            RecordJitMovement(target, backup);
-        } else {
-            backuped_proxy_methods_().emplace(backup);
-        }
-        // Always record backup as deoptimized since we dont want its entrypoint to be updated
-        // by FixupStaticTrampolines on hooker class
-        // Used hook's declaring class here since backup's is no longer the same with hook's
-        RecordDeoptimized(hook->GetDeclaringClass()->GetClassDef(), backup);
-#endif  /* LSPLANT_M6_BACKEND */
         return global_backup;
     }
 
+    /* An uncertain M6 rollback cannot cross this call boundary: the publisher
+     * callback may capture caller-owned opaque state whose lifetime ends when
+     * HookWithBackupPublisher returns. */
+#ifdef LSPLANT_M6_BACKEND
+    if (hook_recorded && !M6TransactionHealthy()) {
+        /* The backend may still dispatch this callback.  Keep the publisher's
+         * non-null backup visible together with hooked_methods_ and its
+         * GlobalRef while the publisher callback and its opaque capture are
+         * still alive on this stack.  A publisher is not required to outlive
+         * HookWithBackupPublisher(), so returning an ambiguous live hook would
+         * immediately make any later rollback callback unsafe to invoke. */
+        bool restored = false;
+        for (int retry = 0; retry < 4 && !restored; ++retry) {
+            restored = DoUnHook(target, backup, hooked_class_def);
+            if (!restored) sched_yield();
+        }
+        if (!restored) {
+            /* Neither clearing the published backup nor returning to a caller
+             * that may destroy its opaque state is safe.  Stop the process
+             * while every retained object is still valid. */
+            LOGE("M6 hook rollback remained ambiguous after retries");
+            std::abort();
+        }
+        /* DoUnHook removed the complete LSPlant record.  The ordinary cleanup
+         * below may now withdraw the publication and release this local
+         * transaction's GlobalRef.  The sticky health gate intentionally
+         * remains false, preventing another M6 transaction in this process. */
+        hook_recorded = false;
+    }
+#endif
+    if (hook_recorded) {
+        ForgetHookedRecord(target, hooked_class_def, backup);
+    }
+    if (backup_published) {
+        RollbackBackupPublication(env, *backup_publisher);
+    }
+    env->DeleteGlobalRef(global_backup);
     return nullptr;
+}
+
+[[maybe_unused]] jobject Hook(JNIEnv *env, jobject target_method,
+                              jobject hooker_object, jobject callback_method) {
+    return HookImpl(env, target_method, hooker_object, callback_method, nullptr);
+}
+
+[[maybe_unused]] jobject HookWithBackupPublisher(
+    JNIEnv *env, jobject target_method, jobject hooker_object,
+    jobject callback_method,
+    const std::function<bool(jobject)> &publish_backup) {
+    return HookImpl(env, target_method, hooker_object, callback_method,
+                    &publish_backup);
 }
 
 [[maybe_unused]] bool UnHook(JNIEnv *env, jobject target_method) {
@@ -1295,26 +1765,21 @@ using ::lsplant::IsHooked;
         return false;
     }
     auto *target = ArtMethod::FromReflectedMethod(env, target_method);
+    std::lock_guard transaction_guard(HookTransactionMutex());
     jobject reflected_backup = nullptr;
     art::ArtMethod *backup = nullptr;
     jmethodID backup_jmethodid = nullptr;
-    if (!hooked_methods_().erase_if(
-            target, [&reflected_backup, &backup, &backup_jmethodid](const auto &it) {
-                std::tie(reflected_backup, backup, backup_jmethodid) = it.second;
-                return reflected_backup != nullptr;
-            })) {
+    jmethodID target_jmethodid = nullptr;
+    hooked_methods_().if_contains(
+        target, [&reflected_backup, &backup, &backup_jmethodid,
+                 &target_jmethodid](const auto &it) {
+            std::tie(reflected_backup, backup, backup_jmethodid,
+                     target_jmethodid) = it.second;
+        });
+    if (!reflected_backup || !backup) {
         LOGE("Unable to unhook a method that is not hooked");
         return false;
     }
-    // FIXME: not atomic, but should be fine
-    hooked_methods_().erase(backup);
-    backuped_proxy_methods_().erase(backup);
-#ifndef LSPLANT_M6_BACKEND
-    hooked_classes_().erase_if(target->GetDeclaringClass()->GetClassDef(), [&target](auto &it) {
-        it.second.erase(target);
-        return it.second.empty();
-    });
-#endif  /* LSPLANT_M6_BACKEND */
     // shadowhook 修（V2）: Android 13+ opaque jni ids 下的 UnHook SIGSEGV 根因与修复。
     //
     // 【根因】env->FromReflectedMethod(reflected_backup) 在 DoHook 之后调用会崩：
@@ -1337,23 +1802,34 @@ using ::lsplant::IsHooked;
     // 的 Java 方法（非 BackupTo 合成品），opaque-id 模式下返回合法 opaque index，写入
     // kInternalMethods 后 JNI_Call*Method 可正常使用。不能用 ArtMethod* 强转代替，
     // 因为 opaque-id 模式下 JNI 调用不接受指针值作为 jmethodID。
-    env->DeleteGlobalRef(reflected_backup);
-    if (DoUnHook(target, backup)) {
-        std::apply(
-            [backup_method = backup_jmethodid,
-             // target_method 是真实的 Java 方法（非 LSPlant 合成品），未被 BackupTo 修改，
-             // env->FromReflectedMethod(target_method) 在 opaque-id 模式下安全且返回合法的
-             // opaque index，写入 kInternalMethods 后 JNI_Call*Method 可正常使用。
-             // （不能用 ArtMethod* 强转——opaque-id 模式下 JNI 不接受指针值作为 jmethodID。）
-             target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
-                ((*v == backup_method && (LOGD("Propagate internal used method because of unhook"),
-                                          *v = target_method_id)) ||
-                 ...);
-            },
-            kInternalMethods);
-        return true;
+    /* Keep every map/set entry and the GlobalRef intact until the physical
+     * restore succeeds.  A failed PTE/inline uninstall is therefore retryable
+     * instead of being reported as logically unhooked. */
+    const art::dex::ClassDef *hooked_class_def = nullptr;
+#ifndef LSPLANT_M6_BACKEND
+    hooked_class_def = target->GetDeclaringClass()->GetClassDef();
+#endif
+    if (!DoUnHook(target, backup, hooked_class_def)) {
+        return false;
     }
-    return false;
+    std::apply(
+        [backup_jmethodid, target_jmethodid](auto... v) {
+            ((*v == backup_jmethodid &&
+              (LOGD("Propagate internal used method because of unhook"),
+               *v = target_jmethodid)) ||
+             ...);
+        },
+        kInternalMethods);
+
+    backuped_proxy_methods_().erase(backup);
+#ifndef LSPLANT_M6_BACKEND
+    env->DeleteGlobalRef(reflected_backup);
+#else
+    /* M6 callbacks can still be in-flight after logical UnHook.  Keep the
+     * reflected backup GlobalRef valid until ART tears down the process. */
+    (void)reflected_backup;
+#endif
+    return true;
 }
 
 [[maybe_unused]] bool IsHooked(JNIEnv *env, jobject method) {
@@ -1371,6 +1847,7 @@ using ::lsplant::IsHooked;
         return false;
     }
     auto *art_method = ArtMethod::FromReflectedMethod(env, method);
+    std::lock_guard transaction_guard(HookTransactionMutex());
     // record the original but not the backup
 #ifndef LSPLANT_M6_BACKEND
     RecordDeoptimized(art_method->GetDeclaringClass()->GetClassDef(), art_method);
@@ -1421,47 +1898,72 @@ using ::lsplant::IsHooked;
     return DexFile::SetTrusted(env, cookie);
 }
 
-void UnHookAll(JNIEnv *env) {
+bool UnHookAll(JNIEnv *env) {
+    std::lock_guard transaction_guard(HookTransactionMutex());
     // L1 Critical fix: 原实现收集 std::get<0>(kv.second) = reflected_backup（backup 的
     // jobject GlobalRef），传给 UnHook(env, reflected_backup)。UnHook 内部
     // FromReflectedMethod(reflected_backup) 得到 backup 的 ArtMethod*，命中辅助条目
     // （reflected_backup=nullptr）→ erase_if 返回 false → 每次 unhook 静默失败
     // = UnHookAll 完整 no-op。M6 Unload Safety 被 KPM 层独立清理掩盖。
     //
-    // 修法: 收集 primary entry 的 key（target ArtMethod*，仅 reflected_backup!=nullptr
-    // 的 primary entry），直接内联 UnHook 核心逻辑。跳过 kInternalMethods 传播——
-    // UnHookAll 是全量拆卸，backup 即将失效，internal methods 指向 backup 无害。
+    // Collect primary target keys. Each entry stays published until DoUnHook
+    // succeeds; failed entries and GlobalRefs remain intact for retry.
     //
     // LFD-1 的 for_each（phmap submap SharedLock 安全遍历）保留；snapshot ArtMethod*
     // 到本地 vector 后释放锁，再逐个做 erase_if（UniqueLock），避免 self-deadlock。
     std::vector<art::ArtMethod*> targets;
-    hooked_methods_().for_each([&targets](const auto &kv) {
-        if (std::get<0>(kv.second) != nullptr) {
-            targets.push_back(kv.first);
-        }
-    });
+    try {
+        hooked_methods_().for_each([&targets](const auto &kv) {
+            if (std::get<0>(kv.second) != nullptr) {
+                targets.push_back(kv.first);
+            }
+        });
+    } catch (const std::bad_alloc &) {
+        LOGE("UnHookAll snapshot allocation failed");
+        return false;
+    }
+    bool all_ok = true;
     for (auto *target : targets) {
         jobject reflected_backup = nullptr;
         art::ArtMethod *backup = nullptr;
         jmethodID backup_jmethodid = nullptr;
-        if (!hooked_methods_().erase_if(
-                target, [&reflected_backup, &backup, &backup_jmethodid](const auto &it) {
-                    std::tie(reflected_backup, backup, backup_jmethodid) = it.second;
-                    return reflected_backup != nullptr;
-                })) {
+        jmethodID target_jmethodid = nullptr;
+        hooked_methods_().if_contains(
+            target, [&reflected_backup, &backup, &backup_jmethodid,
+                     &target_jmethodid](const auto &it) {
+                std::tie(reflected_backup, backup, backup_jmethodid,
+                         target_jmethodid) = it.second;
+            });
+        if (!reflected_backup || !backup) {
             continue;
         }
-        hooked_methods_().erase(backup);
+        const art::dex::ClassDef *hooked_class_def = nullptr;
+#ifndef LSPLANT_M6_BACKEND
+        hooked_class_def = target->GetDeclaringClass()->GetClassDef();
+#endif
+        if (!DoUnHook(target, backup, hooked_class_def)) {
+            all_ok = false;
+            continue;
+        }
+
+        std::apply(
+            [backup_jmethodid, target_jmethodid](auto... v) {
+                ((*v == backup_jmethodid &&
+                  (LOGD("Propagate internal used method because of unhook-all"),
+                   *v = target_jmethodid)) ||
+                 ...);
+            },
+            kInternalMethods);
+
         backuped_proxy_methods_().erase(backup);
 #ifndef LSPLANT_M6_BACKEND
-        hooked_classes_().erase_if(target->GetDeclaringClass()->GetClassDef(), [&target](auto &it) {
-            it.second.erase(target);
-            return it.second.empty();
-        });
-#endif
         env->DeleteGlobalRef(reflected_backup);
-        static_cast<void>(DoUnHook(target, backup));
+#else
+        /* Same lifetime rule as single UnHook: runtime release is unprovable. */
+        (void)reflected_backup;
+#endif
     }
+    return all_ok;
 }
 }  // extern "C++"
 }  // namespace v2

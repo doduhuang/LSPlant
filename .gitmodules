@@ -7,7 +7,7 @@
 	url = https://github.com/jothepro/doxygen-awesome-css.git
 [submodule "test/src/main/jni/external/lsparself"]
 	path = test/src/main/jni/external/lsparself
-	url = git@github.com:LSPosed/lsparself.git
+	url = https://github.com/LSPosed/lsparself.git
 [submodule "test/src/main/jni/external/lsprism"]
 	path = test/src/main/jni/external/lsprism
-	url = git@github.com:LSPosed/lsprism.git
+	url = https://github.com/LSPosed/lsprism.git

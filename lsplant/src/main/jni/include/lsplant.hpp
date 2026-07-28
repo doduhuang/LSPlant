@@ -88,6 +88,19 @@ struct InitInfo {
 [[nodiscard, maybe_unused, gnu::visibility("default")]] bool Init(JNIEnv *env,
                                                                   const InitInfo &info);
 
+/// \brief Query whether the Pixel6/M6 staged transaction can still be committed safely.
+/// A failed backend rollback makes this value sticky-false until process exit, because
+/// publishing any remaining pending slot would be ambiguous. Non-M6 builds always return true.
+/// Callers must check this immediately before ARM_PAGES / commit_hooks publication.
+[[nodiscard, maybe_unused, gnu::visibility("default")]]
+bool M6TransactionHealthy();
+
+/// \brief Execute the Pixel6 ARM/commit callback while all other ART mutator
+/// threads are suspended. The callback must not call back into Java.
+/// Non-M6 builds invoke it directly.
+[[nodiscard, maybe_unused, gnu::visibility("default")]]
+bool M6CommitWithSuspendedThreads(const std::function<bool()> &commit);
+
 /// \brief Hook a Java method by providing the \p target_method together with the context object
 /// \p hooker_object and its callback \p callback_method.
 /// \param[in] env The Java environment. Must not be null.
@@ -129,6 +142,23 @@ struct InitInfo {
                                                                      jobject hooker_object,
                                                                      jobject callback_method);
 
+/// \brief Hook with an atomic backup-publication step.
+/// \param[in] publish_backup Called with the newly created backup global reference
+/// before the target method is modified. Returning false, leaving a pending JNI
+/// exception, throwing a C++ exception, or a later install failure aborts the hook
+/// and invokes the publisher with nullptr. The nullptr rollback must be idempotent;
+/// LSPlant temporarily clears and then restores any original JNI exception around it.
+/// If an M6 backend rollback is ambiguous, the non-null publication and its
+/// GlobalRef remain live until physical restoration is confirmed; clearing the
+/// backup while the callback may still dispatch would be unsafe.
+/// \note This is intended for native plugin APIs: callback-visible state must be
+/// complete before another mutator can dispatch through the new hook.
+[[nodiscard, maybe_unused, gnu::visibility("default")]]
+jobject HookWithBackupPublisher(
+    JNIEnv *env, jobject target_method, jobject hooker_object,
+    jobject callback_method,
+    const std::function<bool(jobject)> &publish_backup);
+
 /// \brief Unhook a Java function that is previously hooked.
 /// \param[in] env The Java environment.
 /// \param[in] target_method The target method that is previously hooked.
@@ -140,9 +170,11 @@ struct InitInfo {
                                                                     jobject target_method);
 
 /// \brief Unhook all currently hooked methods.
-/// Snapshots hooked_methods_() keys then calls UnHook per target.
-[[maybe_unused, gnu::visibility("default")]]
-void UnHookAll(JNIEnv *env);
+/// Snapshots hooked methods and restores each one. Failed entries remain
+/// recorded and can be retried.
+/// \return true only if every snapshotted hook was restored.
+[[nodiscard, maybe_unused, gnu::visibility("default")]]
+bool UnHookAll(JNIEnv *env);
 
 /// \brief Check if a Java function is hooked by LSPlant or not
 /// \param[in] env The Java environment.

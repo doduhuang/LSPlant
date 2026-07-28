@@ -5,6 +5,7 @@ module;
 #include <sys/system_properties.h>
 
 #include <list>
+#include <new>
 #include <shared_mutex>
 #include <string_view>
 
@@ -90,13 +91,10 @@ inline auto IsJavaDebuggable(JNIEnv * env) {
 
 constexpr auto kPointerSize = sizeof(void *);
 
-// shadowhook: 值从 pair<jobject, ArtMethod*> 扩展为 tuple<jobject, ArtMethod*, jmethodID>，
-// 其中第三个元素是在 Hook 时（DoHook 之前，backup 未被 BackupTo 污染时）取到的 backup
-// 的 jmethodID（opaque 模式下是 opaque index，pointer 模式下是 ArtMethod* 强转）。
-// 存入这个值是为了让 UnHook 时的 kInternalMethods 传播在 opaque jni ids 模式下也能正确
-// 比较，而不必在 UnHook 时重新调用 env->FromReflectedMethod（那时 backup 已被 BackupTo
-// 覆写，DexMethodIndex 变成 target 的，ART EncodeGenericId 会越界崩溃）。
-// 对 backup 的辅助条目（nullptr, target, 0）第三字段不使用，置 0。
+// shadowhook: value tuple stores reflected backup, backup ArtMethod, and the
+// pre-DoHook jmethodIDs for both backup and target.  Persisting both IDs lets
+// UnHookAll restore kInternalMethods without reflecting a BackupTo-mutated
+// method (unsafe with opaque JNI IDs) and without needing a target jobject.
 //
 // shadowhook M5.2g.3.1 root cause fix: 这些全局 SharedHashMap/Set/list 默认构造的
 // init_array 顺序与 jni_bridge.cpp 的 __attribute__((constructor)) 顺序不可控.
@@ -107,7 +105,9 @@ constexpr auto kPointerSize = sizeof(void *);
 // 修复: 用 Meyer's singleton (函数内 static, 首次访问惰性构造, thread-safe) 绕开 init_array 顺序.
 
 inline auto& hooked_methods_() {
-    static SharedHashMap<art::ArtMethod *, std::tuple<jobject, art::ArtMethod *, jmethodID>>
+    static SharedHashMap<
+        art::ArtMethod *,
+        std::tuple<jobject, art::ArtMethod *, jmethodID, jmethodID>>
         instance;
     return instance;
 }
@@ -143,6 +143,17 @@ struct M6HookRecord {
     uint64_t original_oat_va;         /* ArtMethod entry_point BEFORE hook install，unhook 时还原 */
     bool     is_entry_point_fallback; /* true = /apex/ 系统类走 SetEntryPoint+shim; false = PTE/UXN */
     uint64_t shim_va;                 /* fallback 专用：命名 shim 页 VA（PTE/UXN 时 0），unhook 时 munmap */
+    /*
+     * REGISTERING 在 KPM syscall 前预占 map 节点，保证 syscall 成功后只做不分配内存的
+     * modify_if；STAGED 等待 ARM_PAGES；PASS_THROUGH 是 smart_uninstall rc=1 后可 rehook
+     * 的常驻 slot；POISONED 表示 backend rollback 结果未知，进程必须停止后续 commit。
+     */
+    enum class State {
+        kRegistering,
+        kStaged,
+        kPassThrough,
+        kPoisoned,
+    } state;
 };
 
 inline auto& m6_hook_slots_() {
@@ -186,7 +197,7 @@ inline auto& jit_movements_lock_() {
 inline art::ArtMethod *IsHooked(art::ArtMethod * art_method, bool including_backup = false) {
     art::ArtMethod *backup = nullptr;
     hooked_methods_().if_contains(art_method, [&backup, &including_backup](const auto &it) {
-        // tuple: (reflected_backup jobject, backup ArtMethod*, backup jmethodID)
+        // tuple: (reflected_backup, backup ArtMethod*, backup ID, target ID)
         // target 条目：reflected_backup 非 null；backup 条目：reflected_backup = null
         if (including_backup || std::get<0>(it.second)) backup = std::get<1>(it.second);
     });
@@ -210,30 +221,170 @@ inline std::list<std::pair<art::ArtMethod *, art::ArtMethod *>> GetJitMovements(
     return std::move(jit_movements_());
 }
 
-// shadowhook: 增加 backup_jmethodid 参数——Hook 时在 DoHook 之前（backup 未被 BackupTo
-// 污染时）取到的 opaque jmethodID，存入 tuple 第三字段，供 UnHook kInternalMethods 传播用。
-inline void RecordHooked(art::ArtMethod * target, const art::dex::ClassDef *class_def,
+inline bool RecordHooked(art::ArtMethod * target, const art::dex::ClassDef *class_def,
                          jobject reflected_backup, art::ArtMethod *backup,
-                         jmethodID backup_jmethodid) {
-    hooked_classes_().lazy_emplace_l(
-        class_def, [&target](auto &it) { it.second.emplace(target); },
-        [&class_def, &target](const auto &ctor) {
-            ctor(class_def, phmap::flat_hash_set<art::ArtMethod *>{target});
-        });
-    hooked_methods_().insert(
-        {std::make_pair(target,
-                        std::make_tuple(reflected_backup, backup, backup_jmethodid)),
-         // backup 的辅助条目：reflected_backup=null 区分身份，jmethodid 置 nullptr（不使用）
-         std::make_pair(backup, std::make_tuple(nullptr, target, static_cast<jmethodID>(nullptr)))});
+                         jmethodID backup_jmethodid, jmethodID target_jmethodid) {
+    bool primary_inserted = false;
+    bool backup_inserted = false;
+    try {
+        primary_inserted = hooked_methods_()
+            .insert(std::make_pair(
+                target, std::make_tuple(reflected_backup, backup,
+                                        backup_jmethodid, target_jmethodid)))
+            .second;
+        if (!primary_inserted) return false;
+
+        backup_inserted = hooked_methods_()
+            .insert(std::make_pair(
+                backup,
+                std::make_tuple(nullptr, target,
+                                static_cast<jmethodID>(nullptr),
+                                static_cast<jmethodID>(nullptr))))
+            .second;
+        if (!backup_inserted) {
+            hooked_methods_().erase(target);
+            return false;
+        }
+
+        if (class_def) {
+            hooked_classes_().lazy_emplace_l(
+                class_def, [&target](auto &it) { it.second.emplace(target); },
+                [&class_def, &target](const auto &ctor) {
+                    ctor(class_def, phmap::flat_hash_set<art::ArtMethod *>{target});
+                });
+        }
+        return true;
+    } catch (const std::bad_alloc &) {
+        if (backup_inserted) hooked_methods_().erase(backup);
+        if (primary_inserted) hooked_methods_().erase(target);
+        if (class_def) {
+            hooked_classes_().erase_if(class_def, [&target](auto &it) {
+                it.second.erase(target);
+                return it.second.empty();
+            });
+        }
+        return false;
+    }
 }
 
-inline void RecordDeoptimized(const art::dex::ClassDef *class_def, art::ArtMethod *art_method) {
+inline void ForgetHookedRecord(art::ArtMethod *target,
+                               const art::dex::ClassDef *class_def,
+                               art::ArtMethod *backup) {
+    hooked_methods_().erase(backup);
+    hooked_methods_().erase(target);
+    if (class_def) {
+        hooked_classes_().erase_if(class_def, [&target](auto &it) {
+            it.second.erase(target);
+            return it.second.empty();
+        });
+    }
+}
+
+/*
+ * All auxiliary records required by a live hook must be allocated before
+ * ArtMethod/entry-point mutation.  Returning from DoHook with a live target
+ * and then growing one of these containers leaves no safe failure rollback.
+ */
+struct HookAuxRecords {
+    bool jit_movement = false;
+    bool proxy_backup = false;
+    bool deoptimized_class = false;
+    bool deoptimized_method = false;
+};
+
+inline void ForgetHookAuxRecords(
+        art::ArtMethod *target, art::ArtMethod *backup,
+        const art::dex::ClassDef *deoptimized_class_def,
+        HookAuxRecords *state) noexcept {
+    if (!state) return;
+    try {
+        if (state->deoptimized_method) {
+            deoptimized_methods_set_().erase(backup);
+            state->deoptimized_method = false;
+        }
+        if (state->deoptimized_class && deoptimized_class_def) {
+            deoptimized_classes_().erase_if(
+                deoptimized_class_def, [&backup](auto &it) {
+                    it.second.erase(backup);
+                    return it.second.empty();
+                });
+            state->deoptimized_class = false;
+        }
+        if (state->proxy_backup) {
+            backuped_proxy_methods_().erase(backup);
+            state->proxy_backup = false;
+        }
+        if (state->jit_movement) {
+            std::unique_lock lk(jit_movements_lock_());
+            for (auto it = jit_movements_().begin();
+                 it != jit_movements_().end(); ++it) {
+                if (it->first == target && it->second == backup) {
+                    jit_movements_().erase(it);
+                    break;
+                }
+            }
+            state->jit_movement = false;
+        }
+    } catch (...) {
+        /* Rollback is best effort only for an impossible mutex/container
+         * exception. DoHook still refuses to activate the target. */
+    }
+}
+
+inline bool RecordHookAuxRecords(
+        art::ArtMethod *target, art::ArtMethod *backup, bool is_proxy,
+        const art::dex::ClassDef *deoptimized_class_def,
+        HookAuxRecords *state) noexcept {
+    if (!target || !backup || !deoptimized_class_def || !state) return false;
+    *state = {};
+    try {
+        if (is_proxy) {
+            state->proxy_backup =
+                backuped_proxy_methods_().insert(backup).second;
+            if (!state->proxy_backup) return false;
+        } else {
+            std::unique_lock lk(jit_movements_lock_());
+            jit_movements_().emplace_back(target, backup);
+            state->jit_movement = true;
+        }
+
+        deoptimized_classes_().lazy_emplace_l(
+            deoptimized_class_def,
+            [state, backup](auto &it) {
+                state->deoptimized_class =
+                    it.second.emplace(backup).second;
+            },
+            [state, deoptimized_class_def, backup](const auto &ctor) {
+                phmap::flat_hash_set<art::ArtMethod *> methods;
+                state->deoptimized_class = methods.emplace(backup).second;
+                ctor(deoptimized_class_def, std::move(methods));
+            });
+        if (!state->deoptimized_class) {
+            ForgetHookAuxRecords(
+                target, backup, deoptimized_class_def, state);
+            return false;
+        }
+
+        state->deoptimized_method =
+            deoptimized_methods_set_().insert(backup).second;
+        if (!state->deoptimized_method) {
+            ForgetHookAuxRecords(
+                target, backup, deoptimized_class_def, state);
+            return false;
+        }
+        return true;
+    } catch (...) {
+        ForgetHookAuxRecords(target, backup, deoptimized_class_def, state);
+        return false;
+    }
+}
+
+inline void RecordDeoptimized(const art::dex::ClassDef *class_def,
+                              art::ArtMethod *art_method) {
+    /* Deoptimize() is a legacy public API without a rollback return channel.
+     * Hook installation does not use this helper; it uses the transactional
+     * RecordHookAuxRecords() path above. */
     { deoptimized_classes_()[class_def].emplace(art_method); }
     deoptimized_methods_set_().insert(art_method);
-}
-
-inline void RecordJitMovement(art::ArtMethod * target, art::ArtMethod * backup) {
-    std::unique_lock lk(jit_movements_lock_());
-    jit_movements_().emplace_back(target, backup);
 }
 }  // namespace lsplant

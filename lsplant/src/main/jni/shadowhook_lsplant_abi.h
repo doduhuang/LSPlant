@@ -33,7 +33,7 @@
 
 /* R2-CM-04: 与 <SH_ROOT>/include/shadowhook_lsplant_abi.h 保持同步. */
 #define SH_M6_OK                (0)
-#define SH_M6_E_INVAL           (-22)
+#define SH_M6_E_INVAL           (-22)  /* Pixel6 staged backend: hard reject, no shim fallback */
 #define SH_M6_E_NOSPC           (-28)
 #define SH_M6_E_FAULT           (-14)
 #define SH_M6_E_NOENT           (-2)

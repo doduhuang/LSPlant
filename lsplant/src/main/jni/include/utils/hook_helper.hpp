@@ -25,6 +25,8 @@ struct Function;
 
 template <FixedString Sym, typename Ret, typename... Args>
 struct Function<Sym, Ret(Args...)> {
+    inline static constexpr auto symbol_ = Sym;
+
     [[gnu::always_inline]] static Ret operator()(Args... args) {
         return inner_.function_(std::forward<Args>(args)...);
     }
@@ -78,6 +80,8 @@ protected:
 template <FixedString Sym, class This, typename Ret, typename... Args>
 struct Function<Sym, Ret (This::*)(Args...)>
     : BaseMemberFunction<Function<Sym, Ret (This::*)(Args...)>, This, Ret, Args...> {
+    inline static constexpr auto symbol_ = Sym;
+
     [[gnu::always_inline]] auto &operator=(void *function) {
         Function::BaseMemberFunction::operator=(function);
         return *this;
@@ -91,6 +95,8 @@ private:
 template <FixedString Sym, class This, typename Ret, typename... Args>
 struct Function<Sym, Ret (This::*const)(Args...)>
     : BaseMemberFunction<Function<Sym, Ret (This::*const)(Args...)>, const This, Ret, Args...> {
+    inline static constexpr auto symbol_ = Sym;
+
     [[gnu::always_inline]] auto &operator=(void *function) {
         Function::BaseMemberFunction::operator=(function);
         return *this;
@@ -101,8 +107,9 @@ private:
     friend struct Function::BaseMemberFunction;
 };
 
-template <FixedString, typename T>
+template <FixedString Sym, typename T>
 struct Field {
+    inline static constexpr auto symbol_ = Sym;
     [[gnu::always_inline]] T *operator->() { return inner_.field_; }
     [[gnu::always_inline]] T &operator*() { return *inner_.field_; }
     [[gnu::always_inline]] operator bool() { return inner_.raw_field_ != nullptr; }
@@ -121,20 +128,21 @@ private:
     static_assert(sizeof(inner_.field_) == sizeof(inner_.raw_field_));
 };
 
-template <FixedString, FuncType>
+template <FixedString, FuncType, auto>
 struct Hooker;
 
-template <FixedString Sym, typename Ret, typename... Args>
-struct Hooker<Sym, Ret(Args...)> : Function<Sym, Ret(Args...)> {
+template <FixedString Sym, typename Ret, typename... Args,
+          Ret (*Replace)(Args...)>
+struct Hooker<Sym, Ret(Args...), Replace> : Function<Sym, Ret(Args...)> {
     [[gnu::always_inline]] auto &operator=(void *function) {
         Hooker::Function::operator=(function);
         return *this;
     }
 
 private:
-    [[gnu::always_inline]] constexpr Hooker(Ret (*replace)(Args...)) { replace_ = replace; };
-
-    inline static Ret (*replace_)(Args...) = nullptr;
+    /* Replacement is encoded in the type as an NTTP. It is therefore a link-
+     * time constant and never depends on .init_array ordering. */
+    inline static constexpr Ret (*replace_)(Args...) = Replace;
     inline static void *address_ = nullptr;
 
     friend struct HookHandler;
@@ -142,19 +150,17 @@ private:
     friend struct Symbol;
 };
 
-template <FixedString Sym, class This, typename Ret, typename... Args>
-struct Hooker<Sym, Ret (This::*)(Args...)> : Function<Sym, Ret (This::*)(Args...)> {
+template <FixedString Sym, class This, typename Ret, typename... Args,
+          Ret (*Replace)(This *, Args...)>
+struct Hooker<Sym, Ret (This::*)(Args...), Replace>
+    : Function<Sym, Ret (This::*)(Args...)> {
     [[gnu::always_inline]] auto &operator=(void *function) {
         Hooker::Function::operator=(function);
         return *this;
     }
 
 private:
-    [[gnu::always_inline]] constexpr Hooker(Ret (*replace)(This *, Args...)) {
-        replace_ = replace;
-    };
-
-    inline static Ret (*replace_)(This *, Args...) = nullptr;
+    inline static constexpr Ret (*replace_)(This *, Args...) = Replace;
     inline static void *address_ = nullptr;
 
     friend struct HookHandler;
@@ -181,9 +187,9 @@ struct HookHandler {
         }
     }
 
-    template <FixedString Sym, typename... Us, template <FixedString, typename...> typename T>
-        requires(requires { T<Sym, Us...>::replace_; })
-    [[gnu::always_inline]] bool unhook(T<Sym, Us...> &hooker) const {
+    template <typename T>
+        requires(requires { T::replace_; })
+    [[gnu::always_inline]] bool unhook(T &hooker) const {
         if (hooker.address_ && info_.inline_unhooker && info_.inline_unhooker(hooker.address_)) {
             hooker = nullptr;
             hooker.address_ = nullptr;
@@ -195,16 +201,16 @@ struct HookHandler {
 private:
     [[gnu::always_inline]] constexpr bool operator()() const { return false; }
 
-    template <FixedString Sym, typename... Us, template <FixedString, typename...> typename T>
-        requires(!requires { T<Sym, Us...>::replace_; })
-    [[gnu::always_inline]] bool handle(T<Sym, Us...> &target, bool match_prefix) const {
-        return target = dlsym<Sym>(match_prefix);
+    template <typename T>
+        requires(!requires { T::replace_; })
+    [[gnu::always_inline]] bool handle(T &target, bool match_prefix) const {
+        return target = dlsym<T::symbol_>(match_prefix);
     }
 
-    template <FixedString Sym, typename... Us, template <FixedString, typename...> typename T>
-        requires(requires { T<Sym, Us...>::replace_; })
-    [[gnu::always_inline]] bool handle(T<Sym, Us...> &hooker, bool match_prefix) const {
-        return hooker = hook(hooker.address_ = dlsym<Sym>(match_prefix),
+    template <typename T>
+        requires(requires { T::replace_; })
+    [[gnu::always_inline]] bool handle(T &hooker, bool match_prefix) const {
+        return hooker = hook(hooker.address_ = dlsym<T::symbol_>(match_prefix),
                              reinterpret_cast<void *>(hooker.replace_));
     }
 
@@ -235,6 +241,19 @@ concept Backup = std::is_function_v<std::remove_pointer_t<F>>;
 template <typename F>
 concept MemBackup = std::is_member_function_pointer_v<std::remove_pointer_t<F>> || Backup<F>;
 
+template <typename>
+struct HookReplaceType;
+
+template <typename Ret, typename... Args>
+struct HookReplaceType<Ret(Args...)> {
+    using type = Ret (*)(Args...);
+};
+
+template <class This, typename Ret, typename... Args>
+struct HookReplaceType<Ret (This::*)(Args...)> {
+    using type = Ret (*)(This *, Args...);
+};
+
 template <FixedString S>
 struct Symbol {
     template <typename T>
@@ -248,24 +267,25 @@ struct Symbol {
 
     [[no_unique_address]] struct Hook {
         template <typename F>
-        auto operator->*(F && /*unused*/) const {
+        consteval auto operator->*(F && /*unused*/) const {
             using Signature = decltype(F::template operator()<&decltype([] static {})::operator()>);
             if constexpr (requires { F::template operator()<&decltype([] {})::operator()>; }) {
-                using HookerType =
-                    Hooker<S, decltype([]<class This, typename Ret, typename... Args>(
-                                           Ret (*)(This *, Args...)) -> Ret (This::*)(Args...) {
-                               return {};
-                           }.template operator()(std::declval<Signature>()))>;
-                return HookerType {
-                    static_cast<decltype(HookerType::replace_)>(
-                        &F::template operator()<HookerType::operator()>)
-                };
+                using HookSignature =
+                    decltype([]<class This, typename Ret, typename... Args>(
+                                 Ret (*)(This *, Args...)) -> Ret (This::*)(Args...) {
+                        return {};
+                    }.template operator()(std::declval<Signature>()));
+                using BackupType = Function<S, HookSignature>;
+                using ReplaceType = typename HookReplaceType<HookSignature>::type;
+                constexpr auto replace = static_cast<ReplaceType>(
+                    &F::template operator()<BackupType::operator()>);
+                return Hooker<S, HookSignature, replace>{};
             } else {
-                using HookerType = Hooker<S, Signature>;
-                return HookerType {
-                    static_cast<decltype(HookerType::replace_)>(
-                        &F::template operator()<HookerType::operator()>)
-                };
+                using BackupType = Function<S, Signature>;
+                using ReplaceType = typename HookReplaceType<Signature>::type;
+                constexpr auto replace = static_cast<ReplaceType>(
+                    &F::template operator()<BackupType::operator()>);
+                return Hooker<S, Signature, replace>{};
             }
         };
     } hook;
