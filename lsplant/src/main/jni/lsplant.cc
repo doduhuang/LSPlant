@@ -978,8 +978,16 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
 
     /* Fail before GenerateTrampoline/BackupTo/access-flag mutation.  System
      * boot-image and interpreter entry points have no staged Pixel 6 backend;
-     * the former shim fallback published too early and is intentionally gone. */
-    if (!shadowhook_m6_is_stageable(target->GetEntryPoint())) {
+     * the former shim fallback published too early and is intentionally gone.
+     *
+     * rehook 特例：rc<0 / partial UnHook 之后，target 当前 entry_point 可能已被
+     * 临时切到 interpreter pass-through。此时真正要重新武装的仍是原始 OAT VA，
+     * 必须用 existing_m6_record.original_oat_va 判 stageable，而不是看当前
+     * target->GetEntryPoint()。 */
+    void *stageable_ep = has_existing_m6_record
+        ? reinterpret_cast<void *>(existing_m6_record.original_oat_va)
+        : target->GetEntryPoint();
+    if (!shadowhook_m6_is_stageable(stageable_ep)) {
         LOGE("M6b DoHook: target entry point is not stageable");
         return false;
     }
@@ -1015,10 +1023,17 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
 
         /* Step 0: is_rehook 检测——Phase C 场景下，target 曾被 partial UnHook，
          * m6_hook_slots_ 仍保有 bridge_slot_idx 记录；直接更新 redirect_va 即可，
-         * 无需重新 install（KPM slot 和 UXN 仍在位）。 */
+         * 无需重新 install（KPM slot 和 UXN 仍在位）。
+         *
+         * L4 路径补强：DoUnHook 的 smart_uninstall error 分支会让 target 暂时走
+         * interpreter bridge（避免误跳已释放 trampoline），因此 rehook 时必须把
+         * target.entry_point 明确改回 original_oat_va；否则仅更新 redirect_va，
+         * target 仍停在解释执行路径，UXN trap 永远不会再命中。 */
         {
             const int32_t existing_bridge_slot =
                 has_existing_m6_record ? existing_m6_record.slot_idx : -1;
+            const uint64_t existing_orig_va =
+                has_existing_m6_record ? existing_m6_record.original_oat_va : 0;
             if (existing_bridge_slot >= 0) {
                 /* This DoHook created a fresh backup ArtMethod above.  Make
                  * that backup callable before staging the KPM redirect; if
@@ -1049,6 +1064,13 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
                     PoisonM6Transaction(target, existing_bridge_slot);
                     LOGE("M6b DoHook rehook: failed to publish staged metadata");
                     return false;
+                }
+                /* target 的 entry_point 恢复到原 OAT VA：
+                 *   - 常规 partial UnHook：它本来就还是 OAT VA，这里是 no-op；
+                 *   - rc<0 error UnHook：target 可能已被临时切到 interp bridge，这里必须切回，
+                 *     让后续 Java 调用重新命中 UXN trap。 */
+                if (existing_orig_va != 0) {
+                    target->SetEntryPoint(reinterpret_cast<void *>(existing_orig_va));
                 }
                 record_guard.committed = true;
                 return true;
@@ -1301,7 +1323,9 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup,
      *   1 = partial：同一 OAT 页上仍有其他方法处于 hook 状态，UXN 保留；
      *       KPM fault handler 已把 redirect_va 改为 backup_ep（ART interp bridge），
      *       使 target 执行效果为「已卸钩」但 m6_hook_slots_ 记录保留（Phase C rehook 依赖）。
-     *  <0 = error：保留 slot、backup 与 LSPlant 记录，向上传播失败并允许重试。
+     *  <0 = error：保留 bridge slot 记录，并让本次 UnHook 继续把 target 切到
+     *       backup 的 pass-through 路径；未来 rehook 再把 target.entry_point
+     *       恢复到 original OAT VA。
      *
      * Note: target's entry_point was never modified by DoHook (M6b uses PTE.UXN=1
      * instead), so after full uninstall the OAT page becomes executable again and the
@@ -1371,10 +1395,25 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup,
                 LOGE("M6b DoUnHook: smart_uninstall(bridge=%d) failed rc=%d;"
                      " PTE.UXN may still be armed — target SIGSEGV risk.",
                      bridge_slot, rc);
-                /* Preserve backup, slot metadata and LSPlant bookkeeping.
-                 * Poison also makes every later ARM_PAGES gate fail closed. */
-                PoisonM6Transaction(target, bridge_slot);
-                return false;
+                if (!TransitionM6HookRecord(
+                        target, bridge_slot,
+                        M6HookRecord::State::kPassThrough)) {
+                    /* metadata 若不能可靠切到 pass-through，后续 rehook/ARM_PAGES
+                     * 都失去一致性保证，只能 sticky poison fail-closed。 */
+                    PoisonM6Transaction(target, bridge_slot);
+                    LOGE("M6b DoUnHook: rc<0 pass-through metadata publish failed");
+                    return false;
+                }
+                /* 保留 m6_hook_slots_ 记录（不 erase），使 bridge_slot 引用不丢失。
+                 * backup.entry_point 保持当前值：
+                 *   - Java 方法：DoHook 时已改成 interpreter bridge；
+                 *   - native 方法：保持 JNI/original bridge。
+                 * 函数尾部的 CopyFrom 会把 target 切到该 pass-through 路径，因此
+                 * 本次 UnHook 的用户态可见效果仍然是“已卸钩”。
+                 *
+                 * 未来同 target 再次 DoHook 时，rehook 路径（Step 0）会找到此
+                 * kPassThrough 记录，更新 redirect_va，并把 target.entry_point
+                 * 显式恢复到 original OAT VA。 */
             }
         } else {
             PoisonM6Transaction(target, bridge_slot);
