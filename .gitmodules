@@ -1,7 +1,7 @@
 [submodule "dex_builder"]
 	path = lsplant/src/main/jni/external/dex_builder
-	url = git@github.com:doduhuang/DexBuilder.git
+	url = ../DexBuilder.git
 	branch = master
 [submodule "docs/doxygen-awesome-css"]
 	path = docs/doxygen-awesome-css
-	url = git@github.com:doduhuang/doxygen-awesome-css.git
+	url = ../doxygen-awesome-css.git
