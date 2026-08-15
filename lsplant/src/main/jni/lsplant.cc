@@ -15,6 +15,8 @@ module;
 #include <bit>
 #include <cstdlib>
 #include <mutex>
+#include <condition_variable>
+#include <pthread.h>
 #include <string_view>
 #include <tuple>
 
@@ -1597,6 +1599,141 @@ using ::lsplant::IsHooked;
 #endif
 }
 
+/* Moving-GC guard（Pine/Tine 修法移植，专用守卫线程版）。
+ *
+ * 克隆式 ART hook 的 backup ArtMethod 是 GC 盲区：裸 operator new 内存、不挂类方法
+ * 数组、不在栈上，其 declaring_class（32 位压缩 GcRoot）不被移动 GC 就地修正；
+ * CC/CMC 压缩后调原方法（Method.invoke → EnsureInitialized → PrettyClass/GetDescriptor）
+ * 读野 Class* 即 SIGSEGV（Pine/Tine 实机事故；LSPlant backup 同为裸克隆，风险同构）。
+ *
+ * 修复：存在活 hook 期间持 disable-moving-gc 计数（只禁移动、不停回收）。
+ * 直取 Heap::IncrementDisableMovingGC 需要 Heap*——Pixel6/A13 的 libart 把
+ * Runtime::GetHeap inline 掉了（dynsym 无此符号），故用公共 JNI 路径：ART 的
+ * GetPrimitiveArrayCritical 内部正是 Heap::IncrementDisableMovingGC（同一计数器、
+ * 可重入、调用时等在途移动 GC 完成），对一个全局 dummy byte[] 持 critical 区间
+ * 即达到同一语义，零私有符号/偏移依赖。
+ *
+ * 关键架构约束（Pixel6/A13 真机实测）：ART 硬性规定 GetPrimitiveArrayCritical 后
+ * 同一线程不得再调其它 JNI（否则 fatal「using JNI after critical get」SIGABRT）。
+ * 因此 critical 由**专用守卫线程**持有：Heap 的 disable-moving-gc 计数是进程
+ * 全局的，哪条线程持锁不影响 GC 语义；业务线程（含 hook 安装线程）的 JNI 使用
+ * 不受限。守卫线程 AttachCurrentThread 后只做：建 dummy → GetPrimitiveArrayCritical
+ * → 等待请求 → ReleasePrimitiveArrayCritical（配对调用合法）。计数 0↔1 转换才与
+ * 守卫线程握手（condvar 同步完成），中间 acquire/release 纯计数。任一步失败 →
+ * 降级 no-op（与改动前行为一致，零回归）。 */
+static std::mutex g_mgc_mutex;
+static std::condition_variable g_mgc_cv;
+static size_t g_mgc_count = 0;
+static bool g_mgc_thread_started = false;
+static bool g_mgc_thread_failed = false;
+static int g_mgc_request = 0;    /* 0=无 1=acquire 2=release */
+static int g_mgc_done = 0;       /* 握手回传：1=ok -1=fail */
+static jbyteArray g_mgc_dummy = nullptr;
+static jbyte *g_mgc_elements = nullptr;
+static bool g_mgc_logged = false;
+
+static void MovingGcGuardThreadMain(JavaVM *vm) {
+    JNIEnv *env = nullptr;
+    if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
+        std::lock_guard lk(g_mgc_mutex);
+        g_mgc_thread_failed = true;
+        g_mgc_done = -1;
+        g_mgc_cv.notify_all();
+        return;
+    }
+
+    /* 建 dummy（持 critical 前的普通 JNI 窗口内完成） */
+    {
+        jbyteArray local = env->NewByteArray(1);
+        if (local) {
+            g_mgc_dummy = (jbyteArray)env->NewGlobalRef(local);
+            env->DeleteLocalRef(local);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
+
+    std::unique_lock lk(g_mgc_mutex);
+    while (true) {
+        g_mgc_cv.wait(lk, [] { return g_mgc_request != 0; });
+        int req = g_mgc_request;
+        g_mgc_request = 0;
+        if (req == 1) {
+            if (g_mgc_dummy && !g_mgc_elements) {
+                g_mgc_elements = (jbyte *)env->GetPrimitiveArrayCritical(g_mgc_dummy, nullptr);
+            }
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                g_mgc_elements = nullptr;
+            }
+            g_mgc_done = g_mgc_elements ? 1 : -1;
+        } else if (req == 2) {
+            if (g_mgc_elements && g_mgc_dummy) {
+                env->ReleasePrimitiveArrayCritical(g_mgc_dummy, g_mgc_elements, JNI_ABORT);
+                g_mgc_done = 1;
+            } else {
+                g_mgc_done = -1;
+            }
+            g_mgc_elements = nullptr;
+        }
+        lk.unlock();
+        g_mgc_cv.notify_all();
+        lk.lock();
+    }
+}
+
+static void *MovingGcGuardThreadEntry(void *arg) {
+    MovingGcGuardThreadMain((JavaVM *)arg);
+    return nullptr;
+}
+
+static void MovingGcGuardAcquire(JNIEnv *env) {
+    std::unique_lock lk(g_mgc_mutex);
+    if (g_mgc_count++ != 0) return;
+
+    if (!g_mgc_thread_started && !g_mgc_thread_failed) {
+        JavaVM *vm = nullptr;
+        if (env && env->GetJavaVM(&vm) == JNI_OK && vm) {
+            pthread_t th;
+            if (pthread_create(&th, nullptr, MovingGcGuardThreadEntry, vm) == 0) {
+                pthread_detach(th);
+                g_mgc_thread_started = true;
+            } else {
+                g_mgc_thread_failed = true;
+            }
+        } else {
+            g_mgc_thread_failed = true;
+        }
+    }
+
+    if (g_mgc_thread_failed) {
+        if (!g_mgc_logged) {
+            LOGW("moving-gc guard unavailable (guard thread); backup declaring_class unprotected");
+            g_mgc_logged = true;
+        }
+        return;
+    }
+
+    g_mgc_done = 0;
+    g_mgc_request = 1;
+    g_mgc_cv.notify_all();
+    g_mgc_cv.wait(lk, [] { return g_mgc_done != 0; });
+    if (g_mgc_done != 1 && !g_mgc_logged) {
+        LOGW("moving-gc guard unavailable; backup declaring_class unprotected");
+        g_mgc_logged = true;
+    }
+}
+
+static void MovingGcGuardRelease(JNIEnv *env) {
+    std::unique_lock lk(g_mgc_mutex);
+    if (g_mgc_count == 0 || --g_mgc_count != 0) return;
+    if (!g_mgc_thread_started || g_mgc_thread_failed) return;
+    (void)env;
+    g_mgc_done = 0;
+    g_mgc_request = 2;
+    g_mgc_cv.notify_all();
+    g_mgc_cv.wait(lk, [] { return g_mgc_done != 0; });
+}
+
 static jobject HookImpl(
     JNIEnv *env, jobject target_method, jobject hooker_object,
     jobject callback_method,
@@ -1735,6 +1872,9 @@ static jobject HookImpl(
         installed = false;
     }
     if (installed) {
+        /* backup 是裸克隆 ArtMethod，declaring_class 不被移动 GC 跟踪；
+         * 活 hook 期间禁移动（见上方 MovingGcGuard）。 */
+        MovingGcGuardAcquire(env);
         std::apply(
             [backup_method, target_jmethodid](auto... v) {
                 ((*v == target_jmethodid &&
@@ -1851,6 +1991,8 @@ static jobject HookImpl(
     if (!DoUnHook(target, backup, hooked_class_def)) {
         return false;
     }
+    /* 与 HookImpl 成功路径的 MovingGcGuardAcquire() 对称：卸钩后 backup 不再被调用。 */
+    MovingGcGuardRelease(env);
     std::apply(
         [backup_jmethodid, target_jmethodid](auto... v) {
             ((*v == backup_jmethodid &&
