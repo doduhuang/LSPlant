@@ -1869,7 +1869,10 @@ static jobject HookImpl(
      * （BackupTo 产生裸克隆 + hook 生效、其他 ART 线程恢复运行）之前就禁移动 GC。
      * 旧实现在成功后才 acquire——DoHook→acquire 窗口内移动 GC 仍可踩 backup 的
      * declaring_class 野指针。配对：成功路径保持持有（UnHook 时 release）；
-     * 失败路径在下方 cleanup 统一 release。 */
+     * 失败路径在下方 cleanup 统一 release。
+     * （2026-08-16 真机验证：此前位置被怀疑导致 hook=0，A/B 回退后证明真凶是
+     * javavis controller 的 V2 memfd 注入 vs System.load 双实例；本位置经
+     * m52g31 + javavis 双 PASS 复核无回归。） */
     MovingGcGuardAcquire(env);
     try {
         installed = DoHook(
