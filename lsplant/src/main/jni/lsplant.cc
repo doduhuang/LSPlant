@@ -105,10 +105,13 @@ extern "C" void shadowhook_ep_spoof_unregister(uintptr_t ep_field_addr);
  * art_quick_to_interpreter_bridge VA。bridge 层传给 KPM fault handler，用于
  * M6b 页命中但无 slot 匹配时重定向到解释器（修 OAT 页污染问题）。 */
 extern "C" void *g_lsplant_interp_bridge_va = nullptr;
-/* bridge/KPM 用同一个、由 ART 符号探测得到的字段偏移校验 fault 现场。
- * 不能在内核里硬编码 ArtMethod 布局。 */
-extern "C" uint32_t g_lsplant_art_method_entry_offset = 0;
 #endif  /* LSPLANT_M6_BACKEND */
+
+/* ArtMethod entry_point 字段偏移（ART 符号探测得到，不硬编码布局）。
+ * 无条件定义：bridge 检测器（art_method_detector）经弱符号读取做严格判定——
+ * 此前定义只在 LSPLANT_M6_BACKEND（已退役）分支内，正常构建里弱符号悬空，
+ * 检测器的严格档被静默跳过。正常 InitNative 在 ArtMethod::Init 后赋值。 */
+extern "C" uint32_t g_lsplant_art_method_entry_offset = 0;
 
 module lsplant;
 
@@ -522,6 +525,9 @@ bool InitNative(JNIEnv *env, const HookHandler &handler) {
         LOGE("Failed to init art method");
         return false;
     }
+    /* 非 M6 路径同样发布 entry_point 偏移：检测器（art_method_detector 弱符号）
+     * 的严格判定档依赖它；定义已移出 M6 ifdef，这里完成唯一赋值。 */
+    g_lsplant_art_method_entry_offset = ArtMethod::GetEntryPointOffset();
     UpdateTrampoline(ArtMethod::GetEntryPointOffset());
     if (!Thread::Init(handler)) {
         LOGE("Failed to init thread");
@@ -1859,6 +1865,12 @@ static jobject HookImpl(
 #endif
     bool hook_recorded = false;
     bool installed = false;
+    /* backup 是裸克隆 ArtMethod，declaring_class 不被移动 GC 跟踪；必须在 DoHook
+     * （BackupTo 产生裸克隆 + hook 生效、其他 ART 线程恢复运行）之前就禁移动 GC。
+     * 旧实现在成功后才 acquire——DoHook→acquire 窗口内移动 GC 仍可踩 backup 的
+     * declaring_class 野指针。配对：成功路径保持持有（UnHook 时 release）；
+     * 失败路径在下方 cleanup 统一 release。 */
+    MovingGcGuardAcquire(env);
     try {
         installed = DoHook(
             target, hook, backup, hooked_class_def,
@@ -1872,9 +1884,8 @@ static jobject HookImpl(
         installed = false;
     }
     if (installed) {
-        /* backup 是裸克隆 ArtMethod，declaring_class 不被移动 GC 跟踪；
-         * 活 hook 期间禁移动（见上方 MovingGcGuard）。 */
-        MovingGcGuardAcquire(env);
+        /* MovingGcGuard 已在 DoHook 前 acquire（见上方），活 hook 期间保持持有，
+         * UnHook 成功路径对称 release。 */
         std::apply(
             [backup_method, target_jmethodid](auto... v) {
                 ((*v == target_jmethodid &&
@@ -1921,6 +1932,8 @@ static jobject HookImpl(
     if (backup_published) {
         RollbackBackupPublication(env, *backup_publisher);
     }
+    /* 失败路径：与 DoHook 前的 MovingGcGuardAcquire 对称释放（成功路径在 UnHook 才释放）。 */
+    MovingGcGuardRelease(env);
     env->DeleteGlobalRef(global_backup);
     return nullptr;
 }
