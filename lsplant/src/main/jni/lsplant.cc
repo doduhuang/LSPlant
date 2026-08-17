@@ -933,7 +933,11 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
     if (out_recorded) *out_recorded = true;
 
     HookAuxRecords aux_records{};
-#ifndef LSPLANT_M6_BACKEND
+    /* HWBP 与 M6 一样不初始化 mirror::Class::Init（其 SetStatus Hooker 需 inline
+     * hook，HWBP 构建的 inline_hooker 是 fail-closed 空桩）⇒ GetClassDef_ 永不解析，
+     * class-def 账簿整体跳过（RecordHooked/ForgetHookedRecord 容忍 null key，
+     * RecordHookAuxRecords 拒 null，故同守卫排除）。 */
+#if !defined(LSPLANT_M6_BACKEND) && !defined(LSPLANT_HWBP_BACKEND)
     if (!RecordHookAuxRecords(
             target, backup, is_proxy, deoptimized_class_def, &aux_records)) {
         LOGE("Failed to reserve auxiliary hook bookkeeping");
@@ -1921,7 +1925,8 @@ static jobject HookImpl(
 
     const art::dex::ClassDef *hooked_class_def = nullptr;
     const art::dex::ClassDef *deoptimized_class_def = nullptr;
-#ifndef LSPLANT_M6_BACKEND
+    /* HWBP：GetClassDef_ 未解析（见 DoHook 注释），严禁触碰；null key 走 M6 同款行为。 */
+#if !defined(LSPLANT_M6_BACKEND) && !defined(LSPLANT_HWBP_BACKEND)
     hooked_class_def = target->GetDeclaringClass()->GetClassDef();
     deoptimized_class_def = hook->GetDeclaringClass()->GetClassDef();
 #endif
@@ -2080,7 +2085,7 @@ static jobject HookImpl(
      * restore succeeds.  A failed PTE/inline uninstall is therefore retryable
      * instead of being reported as logically unhooked. */
     const art::dex::ClassDef *hooked_class_def = nullptr;
-#ifndef LSPLANT_M6_BACKEND
+#if !defined(LSPLANT_M6_BACKEND) && !defined(LSPLANT_HWBP_BACKEND)
     hooked_class_def = target->GetDeclaringClass()->GetClassDef();
 #endif
     if (!DoUnHook(target, backup, hooked_class_def)) {
@@ -2125,9 +2130,9 @@ static jobject HookImpl(
     auto *art_method = ArtMethod::FromReflectedMethod(env, method);
     std::lock_guard transaction_guard(HookTransactionMutex());
     // record the original but not the backup
-#ifndef LSPLANT_M6_BACKEND
+#if !defined(LSPLANT_M6_BACKEND) && !defined(LSPLANT_HWBP_BACKEND)
     RecordDeoptimized(art_method->GetDeclaringClass()->GetClassDef(), art_method);
-#endif  /* LSPLANT_M6_BACKEND */
+#endif  /* !LSPLANT_M6_BACKEND && !LSPLANT_HWBP_BACKEND */
     if (auto *backup = IsHooked(art_method); backup) {
         art_method = backup;
     }
@@ -2214,7 +2219,7 @@ bool UnHookAll(JNIEnv *env) {
             continue;
         }
         const art::dex::ClassDef *hooked_class_def = nullptr;
-#ifndef LSPLANT_M6_BACKEND
+#if !defined(LSPLANT_M6_BACKEND) && !defined(LSPLANT_HWBP_BACKEND)
         hooked_class_def = target->GetDeclaringClass()->GetClassDef();
 #endif
         if (!DoUnHook(target, backup, hooked_class_def)) {
