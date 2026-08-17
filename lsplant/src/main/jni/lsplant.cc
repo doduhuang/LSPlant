@@ -453,48 +453,43 @@ inline void UpdateTrampoline(uint8_t offset) {
         offset >> (CHAR_BIT - entry_point_offset % CHAR_BIT);
 }
 
-#ifdef LSPLANT_M6_BACKEND
-/* Stripped-down InitNative for M6b mode.
- * InitNative also initializes ScopedSuspendAll, Thread, Runtime, ClassLinker
- * (full), and JitCodeCache — all of which install Dobby inline hooks on
- * libart symbols, modifying libart .text and defeating M6b's zero-modification
- * goal.  M6b only needs ArtMethod field offsets (no hooks on API 33), the
- * Runtime::instance_ pointer (for JavaDebuggableGuard in ClassLinker::InitM6b),
- * and the interpreter bridge symbol.
- *
- * Call order: ArtMethod::Init → UpdateTrampoline → Runtime::Init →
- *             ClassLinker::InitM6b.
- * Runtime::Init uses only .as<> symbol lookups (no Dobby hooks).
- * The UpdateTrampoline call bakes the ArtMethod entry_point offset into the
- * trampoline byte array so that GenerateTrampolineFor produces correct patches
- * for the hook ArtMethod's entry_point field. */
-bool InitNativeM6b(JNIEnv *env, const HookHandler &handler) {
+/* Resolve only the ART state needed to establish LSPlant's initialization
+ * contract.  Every handler lookup in this helper is symbol-only: it resolves
+ * .as<> members and never calls InitInfo::inline_hooker. */
+bool InitNativeSymbolOnly(JNIEnv *env, const HookHandler &handler) {
     /* These three helpers are symbol-only Function<> resolvers; unlike ART
      * Hooker<> members they do not call info.inline_hooker or patch libart.
      * They let the final whole-page UXN transition stop other mutators. */
     if (!ScopedSuspendAll::Init(handler) ||
         !Thread::Init(handler) ||
         !ScopedGCCriticalSection::Init(handler)) {
-        LOGE("M6b: Failed to init commit suspension helpers");
+        LOGE("Failed to init symbol-only suspension helpers");
         return false;
     }
     if (!ArtMethod::Init(env, handler)) {
-        LOGE("M6b: Failed to init ArtMethod");
+        LOGE("Failed to init ArtMethod");
         return false;
     }
     g_lsplant_art_method_entry_offset = ArtMethod::GetEntryPointOffset();
     if (g_lsplant_art_method_entry_offset == 0 ||
         g_lsplant_art_method_entry_offset > 128) {
-        LOGE("M6b: invalid ArtMethod entry-point offset");
+        LOGE("Invalid ArtMethod entry-point offset");
         return false;
     }
     UpdateTrampoline(ArtMethod::GetEntryPointOffset());
-    /* Runtime::Init resolves instance_ and SetJavaDebuggable_ via .as<> only.
-     * ClassLinker::InitM6b's JavaDebuggableGuard requires instance_ to be set. */
+    /* Runtime::Init resolves instance_ and SetJavaDebuggable_ via .as<> only. */
     if (!Runtime::Init(handler)) {
-        LOGE("M6b: Failed to init Runtime");
+        LOGE("Failed to init Runtime");
         return false;
     }
+    return true;
+}
+
+#ifdef LSPLANT_M6_BACKEND
+/* Retired M6 keeps its extra interpreter-bridge setup outside the neutral
+ * helper.  HWBP neither defines this selector nor compiles this branch. */
+bool InitNativeM6b(JNIEnv *env, const HookHandler &handler) {
+    if (!InitNativeSymbolOnly(env, handler)) return false;
     if (!ClassLinker::InitM6b(env, handler)) {
         LOGE("M6b: Failed to init ClassLinker interpreter bridge");
         return false;
@@ -1563,20 +1558,16 @@ using ::lsplant::IsHooked;
         return false;
     }
     bool static kInit = InitConfig(info) && InitJNI(env)
-#ifndef LSPLANT_M6_BACKEND
-        /* InitNative installs ~35 Dobby inline hooks on libart functions
-         * (FixupStaticTrampolines, ClassLinker::InitializeClass, etc.).
-         * The retired M6 source configuration skips those inline hooks and
-         * initializes only the symbol-resolved suspension subset below. */
-        && InitNative(env, info)
-#else
-        /* M6b: call only the Dobby-free subset needed for DoHook.
-         * ArtMethod::Init sets art_method_field + access_flags_offset (no
-         * Dobby hooks on API 33). ScopedSuspendAll/Thread/GC helpers are
-         * symbol-only resolvers, and ClassLinker::InitM6b resolves only the
-         * interpreter bridge entry point. */
+#if defined(LSPLANT_HWBP_BACKEND)
+        /* HWBP establishes symbol resolution only.  Its fail-closed bridge
+         * callbacks make an unexpected inline request fail instead of
+         * reaching the default Dobby initialization path. */
+        && InitNativeSymbolOnly(env, info)
+#elif defined(LSPLANT_M6_BACKEND)
         && InitNativeM6b(env, info)
-#endif  /* LSPLANT_M6_BACKEND */
+#else
+        && InitNative(env, info)
+#endif
         ;
     return kInit;
 }
