@@ -113,6 +113,17 @@ extern "C" void *g_lsplant_interp_bridge_va = nullptr;
  * 检测器的严格档被静默跳过。正常 InitNative 在 ArtMethod::Init 后赋值。 */
 extern "C" uint32_t g_lsplant_art_method_entry_offset = 0;
 
+#ifdef LSPLANT_HWBP_BACKEND
+/* Java HWBP backend: target ArtMethod entry stays on its original compiled
+ * code; KPM exception handling redirects only the matching PC. */
+extern "C" bool shadowhook_hwbp_install_for_lsplant(void *target,
+                                                      void *trampoline);
+extern "C" bool shadowhook_hwbp_rollback(uint64_t target_addr,
+                                           uint32_t tgid);
+extern "C" bool shadowhook_hwbp_transaction_healthy();
+extern "C" bool shadowhook_hwbp_uninstall_for_lsplant(void *target);
+#endif
+
 module lsplant;
 
 import dex_builder;
@@ -480,6 +491,12 @@ bool InitNativeSymbolOnly(JNIEnv *env, const HookHandler &handler) {
     /* Runtime::Init resolves instance_ and SetJavaDebuggable_ via .as<> only. */
     if (!Runtime::Init(handler)) {
         LOGE("Failed to init Runtime");
+        return false;
+    }
+    /* HWBP and retired M6 only need the interpreter bridge seam.  The full
+     * ClassLinker::Init would install inline hooks and is never selected here. */
+    if (!ClassLinker::InitSymbolOnly(env, handler)) {
+        LOGE("Failed to init symbol-only ClassLinker interpreter bridge");
         return false;
     }
     return true;
@@ -943,6 +960,12 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
              * and GlobalRef for UnHookAll/restart containment. */
             if (!g_m6_transaction_healthy.load(std::memory_order_acquire)) return;
 #endif
+#ifdef LSPLANT_HWBP_BACKEND
+            /* An ambiguous HWBP rollback has the same containment rule: keep
+             * the record and publisher-visible backup until DoHook's caller
+             * can run the explicit retry/abort path below. */
+            if (!shadowhook_hwbp_transaction_healthy()) return;
+#endif
             /* SetNonIntrinsic/BackupTo/SetNonCompilable only mutate the target's
              * access flags before the backend's commit point.  Restore the exact
              * pre-transaction value on every definite failure so a rejected Hook
@@ -1009,7 +1032,39 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
 
         target->SetNonCompilable();
 
-#ifdef LSPLANT_M6_BACKEND
+#if defined(LSPLANT_HWBP_BACKEND)
+        /* ================================================================
+         * Java HWBP backend: preserve target dispatch exactly as ART compiled
+         * it.  Only the backup is moved to the interpreter bridge; the KPM
+         * exception handler redirects a matching execution fault to the
+         * LSPlant trampoline.  There is no Dobby/PTE path and no target
+         * SetEntryPoint commit in this arm.                          */
+        void *target_entry_point_before = target->GetEntryPoint();
+        if (!target_entry_point_before) {
+            LOGE("HWBP DoHook: target has no compiled entry");
+            return false;
+        }
+        if (!backup->IsNative() &&
+            !ClassLinker::SetEntryPointsToInterpreter(backup)) {
+            LOGE("HWBP DoHook: backup interpreter bridge initialization failed");
+            return false;
+        }
+        if (!shadowhook_hwbp_install_for_lsplant(
+                target_entry_point_before, entrypoint)) {
+            LOGE("HWBP DoHook: per-thread transaction failed");
+            return false;
+        }
+        if (target->GetEntryPoint() != target_entry_point_before) {
+            /* An external ArtMethod mutation is not ours to repair.  Attempt
+             * the backend cleanup, but never claim a successful rollback if it
+             * is ambiguous. */
+            if (!shadowhook_hwbp_uninstall_for_lsplant(
+                    target_entry_point_before)) {
+                LOGE("HWBP DoHook: entry preservation check rollback ambiguous");
+            }
+            return false;
+        }
+#elif defined(LSPLANT_M6_BACKEND)
         /* ============================================================
          * M6b PTE/UXN 主路径：直接在 OAT/JIT 页 PTE.UXN=1；不改 ArtMethod.entry_point。
          * 不需要 Dobby (InitNative 被 Init() 跳过)。
@@ -1317,7 +1372,23 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup,
                                     art::gc::kCollectorTypeDebugger);
     ScopedSuspendAll suspend("LSPlant UnHook", false);
     LOGV("Unhooking: target = %p, backup = %p", target, backup);
-#ifdef LSPLANT_M6_BACKEND
+#if defined(LSPLANT_HWBP_BACKEND)
+    /* HWBP teardown is target-wide: remove the auto-thread rule first, then
+     * every existing/new-thread node.  Any negative result is sticky-false;
+     * keep LSPlant's record live so a caller can retry instead of guessing
+     * that a node was removed. */
+    void *target_entry_point_before = target->GetEntryPoint();
+    if (!target_entry_point_before ||
+        !shadowhook_hwbp_uninstall_for_lsplant(target_entry_point_before)) {
+        LOGE("HWBP DoUnHook: transaction cleanup failed; record retained");
+        return false;
+    }
+    /* The hook backup was intentionally made interpreter-safe for callback
+     * invocation.  Restore its original compiled entry before the shared
+     * CopyFrom(backup) below, otherwise that interpreter bridge would be
+     * copied back into target and violate entry preservation. */
+    backup->SetEntryPoint(target_entry_point_before);
+#elif defined(LSPLANT_M6_BACKEND)
     /* M6b DoUnHook: smart_uninstall KPM slot + restore backup entry_point → original OAT VA
      * (so the subsequent CopyFrom propagates the correct VA back to target).
      *
@@ -1917,6 +1988,23 @@ static jobject HookImpl(
          * below may now withdraw the publication and release this local
          * transaction's GlobalRef.  The sticky health gate intentionally
          * remains false, preventing another M6 transaction in this process. */
+        hook_recorded = false;
+    }
+#endif
+#ifdef LSPLANT_HWBP_BACKEND
+    /* An install rollback that could not prove every node was removed must
+     * stay inside the same explicit cleanup boundary while the publisher's
+     * GlobalRef and callback capture are still alive. */
+    if (hook_recorded && !shadowhook_hwbp_transaction_healthy()) {
+        bool restored = false;
+        for (int retry = 0; retry < 4 && !restored; ++retry) {
+            restored = DoUnHook(target, backup, hooked_class_def);
+            if (!restored) sched_yield();
+        }
+        if (!restored) {
+            LOGE("HWBP hook rollback remained ambiguous after retries");
+            std::abort();
+        }
         hook_recorded = false;
     }
 #endif

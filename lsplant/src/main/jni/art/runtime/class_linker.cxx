@@ -365,15 +365,12 @@ public:
         return true;
     }
 
-#ifdef LSPLANT_M6_BACKEND
-    /* Resolve only the interpreter bridge entry point for M6b mode.
-     * ClassLinker::Init also installs Dobby hooks on FixupStaticTrampolines*,
-     * Register/UnregisterNative*, AdjustThreadVisibilityCounter_, and
-     * MarkVisiblyInitialized_ — all of which would modify libart .text,
-     * defeating M6b's zero-modification goal.  This function replaces that
-     * full Init with a symbol-only pass that calls HookHandler exclusively on
-     * .as<> members, so info_.inline_hooker is never invoked. */
-    static bool InitM6b(JNIEnv *env, const HookHandler &handler) {
+    /* Resolve only the interpreter bridge entry point.  ClassLinker::Init
+     * installs inline hooks on FixupStaticTrampolines*, Register/UnregisterNative*,
+     * AdjustThreadVisibilityCounter_, and MarkVisiblyInitialized_.  This seam
+     * intentionally calls HookHandler only for .as<> symbols, so neither the
+     * HWBP backend nor retired M6 has to invoke the full ClassLinker Init. */
+    static bool InitSymbolOnly(JNIEnv *env, const HookHandler &handler) {
         if (!handler(SetEntryPointsToInterpreter_)) [[likely]] {
             if (handler(GetOptimizedCodeFor_, GetOptimizedCodeForL_, true)) [[likely]] {
                 auto obj = JNI_FindClass(env, "java/lang/Object");
@@ -399,6 +396,11 @@ public:
                  &art_quick_to_interpreter_bridge_);
         }
         return true;
+    }
+
+#ifdef LSPLANT_M6_BACKEND
+    static bool InitM6b(JNIEnv *env, const HookHandler &handler) {
+        return InitSymbolOnly(env, handler);
     }
 #endif  /* LSPLANT_M6_BACKEND */
 
