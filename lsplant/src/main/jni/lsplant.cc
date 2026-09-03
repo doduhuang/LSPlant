@@ -921,6 +921,27 @@ bool DoHook(ArtMethod *target, ArtMethod *hook, ArtMethod *backup,
     LOGV("Hooking: target = %s(%p), hook = %s(%p), backup = %s(%p)", target->PrettyMethod().c_str(),
          target, hook->PrettyMethod().c_str(), hook, backup->PrettyMethod().c_str(), backup);
 
+#ifdef LSPLANT_HWBP_BACKEND
+    /* Android ART may compile one JNI transition stub for several native
+     * methods with the same shorty/static/native-mode tuple.  Such a stub does
+     * live in the process-local JIT cache, but a PC breakpoint still cannot
+     * distinguish which ArtMethod entered it.  Reject native targets before
+     * publishing bookkeeping or mutating either ArtMethod. */
+    if (target->IsNative()) {
+        LOGE("HWBP DoHook: native methods may share an ART JIT JNI stub");
+        return false;
+    }
+    /* Every ART proxy method uses the process-wide
+     * art_quick_proxy_invoke_handler entry.  A hardware breakpoint can match
+     * only the shared PC, not the ArtMethod carried in x0, so arming one proxy
+     * method would redirect unrelated proxy calls to this hook's trampoline.
+     * Reject before publishing bookkeeping or mutating either ArtMethod. */
+    if (is_proxy) {
+        LOGE("HWBP DoHook: proxy methods use a shared ART entry point");
+        return false;
+    }
+#endif
+
     /* Publish all fallible bookkeeping while the same SuspendAll boundary that
      * protects ArtMethod mutation is active, but before touching either method.
      * This prevents a concurrent class-initialization callback from observing a
